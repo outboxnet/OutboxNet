@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="OutboxNet.SampleApp/OutboxNet.SampleApp.csproj" Id="eee5f658-8c5b-48ba-a9d5-0d4244991765" />
     <Project Path="src/OutboxNet.AzureFunctions/OutboxNet.AzureFunctions.csproj" />
     <Project Path="src/OutboxNet.AzureStorageQueue/OutboxNet.AzureStorageQueue.csproj" />
     <Project Path="src/OutboxNet.Core/OutboxNet.Core.csproj" />

@@ -14,7 +14,7 @@ public static class ServiceCollectionExtensions
     /// active transaction of your <typeparamref name="TDbContext"/> to guarantee atomicity
     /// between domain writes and outbox inserts.
     /// </summary>
-    public static IOutboxNetBuilder UseSqlServer<TDbContext>(
+    public static IOutboxNetBuilder UseSqlServerContext<TDbContext>(
         this IOutboxNetBuilder builder,
         string connectionString,
         Action<EfCoreSqlServerOptions>? configure = null)
