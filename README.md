@@ -1,6 +1,6 @@
 # OutboxNet
 
-[![CI](https://github.com/undefined-exception/OutboxNet/actions/workflows/ci.yml/badge.svg)](https://github.com/undefined-exception/OutboxNet/actions/workflows/ci.yml)
+[![CI](https://github.com/outboxnet/OutboxNet/actions/workflows/ci.yml/badge.svg)](https://github.com/outboxnet/OutboxNet/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/OutboxNet.Core.svg)](https://www.nuget.org/packages/OutboxNet.Core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
