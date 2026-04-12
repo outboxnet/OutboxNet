@@ -1,3 +1,4 @@
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,34 +31,58 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
     }
 
     public async Task<IReadOnlyList<OutboxMessage>> LockNextBatchAsync(
-        int batchSize,
-        TimeSpan visibilityTimeout,
-        string lockedBy,
-        CancellationToken ct = default)
+       int batchSize,
+       TimeSpan visibilityTimeout,
+       string lockedBy,
+       CancellationToken ct = default)
     {
+        var schema = _options.SchemaName;
         var lockedUntil = DateTimeOffset.UtcNow.Add(visibilityTimeout);
-        var now = DateTimeOffset.UtcNow;
 
-        var updated = await _dbContext.OutboxMessages
-            .Where(m => (m.Status == MessageStatus.Pending || m.Status == MessageStatus.Processing)
-                     && (m.LockedUntil == null || m.LockedUntil < now)
-                     && (m.NextRetryAt == null || m.NextRetryAt <= now))
-            .OrderBy(m => m.CreatedAt)
-            .Take(batchSize)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.Status, MessageStatus.Processing)
-                .SetProperty(m => m.LockedUntil, lockedUntil)
-                .SetProperty(m => m.LockedBy, lockedBy), ct);
-
-        if (updated == 0)
-            return [];
+        var sql = $"""
+            UPDATE TOP (@batchSize) m
+            SET
+                m.[Status] = @processingStatus,
+                m.[LockedUntil] = @lockedUntil,
+                m.[LockedBy] = @lockedBy
+            OUTPUT
+                INSERTED.[Id],
+                INSERTED.[EventType],
+                INSERTED.[Payload],
+                INSERTED.[CorrelationId],
+                INSERTED.[TraceId],
+                INSERTED.[Status],
+                INSERTED.[RetryCount],
+                INSERTED.[CreatedAt],
+                INSERTED.[ProcessedAt],
+                INSERTED.[LockedUntil],
+                INSERTED.[LockedBy],
+                INSERTED.[NextRetryAt],
+                INSERTED.[LastError],
+                INSERTED.[Headers]
+            FROM [{schema}].[OutboxMessages] m WITH (UPDLOCK, READPAST)
+            WHERE m.[Status] IN (@pendingStatus, @processingStatus)
+              AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
+              AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
+            ORDER BY m.[CreatedAt]
+            """;
 
         var messages = await _dbContext.OutboxMessages
-            .Where(m => m.LockedBy == lockedBy && m.LockedUntil == lockedUntil)
+            .FromSqlRaw(
+                sql,
+                new SqlParameter("@batchSize", batchSize),
+                new SqlParameter("@processingStatus", (int)MessageStatus.Processing),
+                new SqlParameter("@pendingStatus", (int)MessageStatus.Pending),
+                new SqlParameter("@lockedUntil", lockedUntil),
+                new SqlParameter("@lockedBy", lockedBy))
             .AsNoTracking()
             .ToListAsync(ct);
 
-        _logger.LogDebug("Locked {Count} outbox messages for processing by {LockedBy}", messages.Count, lockedBy);
+        _logger.LogDebug(
+            "Locked {Count} outbox messages for processing by {LockedBy}",
+            messages.Count,
+            lockedBy);
+
         return messages;
     }
 
