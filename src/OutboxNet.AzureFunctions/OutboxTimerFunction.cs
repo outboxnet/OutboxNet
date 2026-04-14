@@ -20,13 +20,14 @@ public sealed class OutboxTimerFunction
 
     [Function("OutboxProcessor")]
     public async Task RunAsync(
-        [TimerTrigger("*/10 * * * * *")] TimerInfo timer,
+        // Override via host.json / appsettings: "Outbox:TimerCron": "*/10 * * * * *"
+        [TimerTrigger("%Outbox:TimerCron%")] TimerInfo timer,
         CancellationToken ct)
     {
         _logger.LogDebug("Outbox timer function triggered at {Time}", DateTimeOffset.UtcNow);
 
         using var scope = _serviceProvider.CreateScope();
         var processor = scope.ServiceProvider.GetRequiredService<IOutboxProcessor>();
-        await processor.ProcessBatchAsync(ct);
+        _ = await processor.ProcessBatchAsync(ct);
     }
 }

@@ -33,7 +33,10 @@ public static class ServiceCollectionExtensions
 
         builder.Services.AddHttpClient<IWebhookDeliverer, HttpWebhookDeliverer>(client =>
         {
-            client.Timeout = options.HttpTimeout;
+            // Disable the global HttpClient timeout. Each request is controlled by
+            // a per-subscription CancellationToken (subscription.Timeout via CancelAfter)
+            // so a too-small global timeout would fire the wrong exception type.
+            client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
         });
 
         builder.Services.AddSingleton<IRetryPolicy, ExponentialBackoffRetryPolicy>();

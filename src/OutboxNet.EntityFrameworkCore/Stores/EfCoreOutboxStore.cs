@@ -39,8 +39,43 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         var schema = _options.SchemaName;
         var lockedUntil = DateTimeOffset.UtcNow.Add(visibilityTimeout);
 
+        var tenantFilterClause = _options.TenantFilter is not null
+            ? "AND m.[TenantId] = @tenantFilter"
+            : string.Empty;
+
+        // Null-safe partition equality: (a = b) OR (a IS NULL AND b IS NULL)
+        var orderingClause = _options.EnableOrderedProcessing
+            ? $"""
+
+              AND (
+                (m.[TenantId] IS NULL AND m.[UserId] IS NULL AND m.[EntityId] IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (NOLOCK)
+                    WHERE m2.[Status] = @processingStatus
+                      AND m2.[LockedUntil] > SYSDATETIMEOFFSET()
+                      AND (m2.[TenantId] = m.[TenantId] OR (m2.[TenantId] IS NULL AND m.[TenantId] IS NULL))
+                      AND (m2.[UserId]   = m.[UserId]   OR (m2.[UserId]   IS NULL AND m.[UserId]   IS NULL))
+                      AND (m2.[EntityId] = m.[EntityId] OR (m2.[EntityId] IS NULL AND m.[EntityId] IS NULL))
+                      AND m2.[Id] != m.[Id]
+                )
+              )
+              """
+            : string.Empty;
+
+        // Use a CTE to guarantee ORDER BY is respected when selecting the batch.
+        // Plain UPDATE TOP(n) ... ORDER BY does not guarantee which rows are picked.
         var sql = $"""
-            UPDATE TOP (@batchSize) m
+            WITH Candidates AS (
+                SELECT TOP (@batchSize) m.[Id]
+                FROM [{schema}].[OutboxMessages] m WITH (UPDLOCK, READPAST)
+                WHERE m.[Status] IN (@pendingStatus, @processingStatus)
+                  AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
+                  AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
+                  {tenantFilterClause}
+                {orderingClause}
+                ORDER BY m.[CreatedAt]
+            )
+            UPDATE m
             SET
                 m.[Status] = @processingStatus,
                 m.[LockedUntil] = @lockedUntil,
@@ -59,12 +94,12 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 INSERTED.[LockedBy],
                 INSERTED.[NextRetryAt],
                 INSERTED.[LastError],
-                INSERTED.[Headers]
-            FROM [{schema}].[OutboxMessages] m WITH (UPDLOCK, READPAST)
-            WHERE m.[Status] IN (@pendingStatus, @processingStatus)
-              AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
-              AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
-            ORDER BY m.[CreatedAt]
+                INSERTED.[Headers],
+                INSERTED.[TenantId],
+                INSERTED.[UserId],
+                INSERTED.[EntityId]
+            FROM [{schema}].[OutboxMessages] m
+            INNER JOIN Candidates c ON c.[Id] = m.[Id]
             """;
 
         var messages = await _dbContext.OutboxMessages
@@ -74,7 +109,8 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 new SqlParameter("@processingStatus", (int)MessageStatus.Processing),
                 new SqlParameter("@pendingStatus", (int)MessageStatus.Pending),
                 new SqlParameter("@lockedUntil", lockedUntil),
-                new SqlParameter("@lockedBy", lockedBy))
+                new SqlParameter("@lockedBy", lockedBy),
+                new SqlParameter("@tenantFilter", (object?)_options.TenantFilter ?? DBNull.Value))
             .AsNoTracking()
             .ToListAsync(ct);
 
@@ -157,6 +193,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                      && m.LockedUntil < DateTimeOffset.UtcNow)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(m => m.Status, MessageStatus.Pending)
+                .SetProperty(m => m.RetryCount, m => m.RetryCount + 1)
                 .SetProperty(m => m.LockedUntil, (DateTimeOffset?)null)
                 .SetProperty(m => m.LockedBy, (string?)null), ct);
 

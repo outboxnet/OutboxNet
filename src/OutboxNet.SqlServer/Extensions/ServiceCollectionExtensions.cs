@@ -20,7 +20,9 @@ public static class ServiceCollectionExtensions
         builder.Services.Configure<DirectSqlOptions>(o => o.ConnectionString = connectionString);
 
         builder.Services.AddScoped<IOutboxStore, DirectSqlOutboxStore>();
-        builder.Services.AddScoped<ISubscriptionStore, DirectSqlSubscriptionStore>();
+        builder.Services.AddScoped<DirectSqlSubscriptionStore>();
+        builder.Services.AddScoped<ISubscriptionStore>(sp => sp.GetRequiredService<DirectSqlSubscriptionStore>());
+        builder.Services.AddScoped<ISubscriptionReader>(sp => sp.GetRequiredService<DirectSqlSubscriptionStore>());
         builder.Services.AddScoped<IDeliveryAttemptStore, DirectSqlDeliveryAttemptStore>();
         builder.Services.AddScoped<IOutboxPublisher, DirectSqlOutboxPublisher>();
 

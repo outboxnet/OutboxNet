@@ -15,6 +15,7 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
     private readonly TDbContext _userDbContext;
     private readonly OutboxDbContext _outboxDbContext;
     private readonly IMessageSerializer _serializer;
+    private readonly IOutboxContextAccessor _contextAccessor;
     private readonly OutboxOptions _options;
     private readonly ILogger<EfCoreOutboxPublisher<TDbContext>> _logger;
 
@@ -22,12 +23,14 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         TDbContext userDbContext,
         OutboxDbContext outboxDbContext,
         IMessageSerializer serializer,
+        IOutboxContextAccessor contextAccessor,
         IOptions<OutboxOptions> options,
         ILogger<EfCoreOutboxPublisher<TDbContext>> logger)
     {
         _userDbContext = userDbContext;
         _outboxDbContext = outboxDbContext;
         _serializer = serializer;
+        _contextAccessor = contextAccessor;
         _options = options.Value;
         _logger = logger;
     }
@@ -36,6 +39,7 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         string eventType,
         object payload,
         string? correlationId = null,
+        string? entityId = null,
         Dictionary<string, string>? headers = null,
         CancellationToken cancellationToken = default)
     {
@@ -49,7 +53,9 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         // Enlist the OutboxDbContext in the user's existing transaction so the
         // outbox INSERT is atomic with the caller's domain writes.
         var dbTransaction = transaction.GetDbTransaction();
-        _outboxDbContext.Database.SetDbConnection(_userDbContext.Database.GetDbConnection());
+        // contextOwnsConnection: false — the user's DbContext owns the connection lifetime.
+        _outboxDbContext.Database.SetDbConnection(
+            _userDbContext.Database.GetDbConnection(), contextOwnsConnection: false);
         await _outboxDbContext.Database.UseTransactionAsync(
             dbTransaction, cancellationToken);
 
@@ -66,7 +72,10 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
             Status = MessageStatus.Pending,
             RetryCount = 0,
             CreatedAt = DateTimeOffset.UtcNow,
-            Headers = headers
+            Headers = headers,
+            TenantId = _contextAccessor.TenantId,
+            UserId = _contextAccessor.UserId,
+            EntityId = entityId
         };
 
         _outboxDbContext.OutboxMessages.Add(message);

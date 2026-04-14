@@ -1,4 +1,5 @@
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NSubstitute;
@@ -13,19 +14,30 @@ namespace OutboxNet.Processor.Tests;
 public class OutboxProcessingPipelineTests
 {
     private readonly IOutboxStore _outboxStore = Substitute.For<IOutboxStore>();
-    private readonly ISubscriptionStore _subscriptionStore = Substitute.For<ISubscriptionStore>();
+    private readonly ISubscriptionReader _subscriptionReader = Substitute.For<ISubscriptionReader>();
     private readonly IDeliveryAttemptStore _deliveryAttemptStore = Substitute.For<IDeliveryAttemptStore>();
     private readonly IWebhookDeliverer _webhookDeliverer = Substitute.For<IWebhookDeliverer>();
     private readonly IRetryPolicy _retryPolicy = Substitute.For<IRetryPolicy>();
 
     private OutboxProcessingPipeline CreatePipeline(OutboxOptions? options = null)
     {
+        // Build a scope factory that returns our mocks from both batch and message scopes.
+        var scopeFactory = Substitute.For<IServiceScopeFactory>();
+        var scope = Substitute.For<IServiceScope>();
+        var sp = Substitute.For<IServiceProvider>();
+
+        scope.ServiceProvider.Returns(sp);
+        scopeFactory.CreateScope().Returns(scope);
+
+        sp.GetService(typeof(IOutboxStore)).Returns(_outboxStore);
+        sp.GetService(typeof(ISubscriptionReader)).Returns(_subscriptionReader);
+        sp.GetService(typeof(IDeliveryAttemptStore)).Returns(_deliveryAttemptStore);
+        sp.GetService(typeof(IWebhookDeliverer)).Returns(_webhookDeliverer);
+        sp.GetService(typeof(IMessagePublisher)).Returns(null);
+
         var opts = Microsoft.Extensions.Options.Options.Create(options ?? new OutboxOptions());
         return new OutboxProcessingPipeline(
-            _outboxStore,
-            _subscriptionStore,
-            _deliveryAttemptStore,
-            _webhookDeliverer,
+            scopeFactory,
             _retryPolicy,
             opts,
             NullLogger<OutboxProcessingPipeline>.Instance);
@@ -55,6 +67,12 @@ public class OutboxProcessingPipelineTests
             .Returns(true);
     }
 
+    private void SetupNoSuccessfulDelivery()
+    {
+        _deliveryAttemptStore.HasSuccessfulDeliveryAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<CancellationToken>())
+            .Returns(false);
+    }
+
     [Fact]
     public async Task ProcessBatchAsync_ReleasesExpiredLocks_BeforeLocking()
     {
@@ -68,15 +86,16 @@ public class OutboxProcessingPipelineTests
     }
 
     [Fact]
-    public async Task ProcessBatchAsync_NoMessages_DoesNothing()
+    public async Task ProcessBatchAsync_NoMessages_ReturnsZero()
     {
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage>());
 
         var pipeline = CreatePipeline();
-        await pipeline.ProcessBatchAsync();
+        var result = await pipeline.ProcessBatchAsync();
 
-        await _subscriptionStore.DidNotReceive().GetByEventTypeAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        result.Should().Be(0);
+        await _subscriptionReader.DidNotReceive().GetForMessageAsync(Arg.Any<OutboxMessage>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -97,7 +116,7 @@ public class OutboxProcessingPipelineTests
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
-        _subscriptionStore.GetByEventTypeAsync("order.placed", Arg.Any<CancellationToken>())
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription>());
 
         var pipeline = CreatePipeline();
@@ -136,6 +155,7 @@ public class OutboxProcessingPipelineTests
     {
         SetupLockHeld();
         SetupMarkAsProcessed();
+        SetupNoSuccessfulDelivery();
 
         var message = new OutboxMessage
         {
@@ -158,7 +178,7 @@ public class OutboxProcessingPipelineTests
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
-        _subscriptionStore.GetByEventTypeAsync("order.placed", Arg.Any<CancellationToken>())
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
         _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
@@ -181,6 +201,7 @@ public class OutboxProcessingPipelineTests
     {
         SetupLockHeld();
         SetupIncrementRetry();
+        SetupNoSuccessfulDelivery();
 
         var message = new OutboxMessage
         {
@@ -198,13 +219,14 @@ public class OutboxProcessingPipelineTests
             EventType = "order.placed",
             WebhookUrl = "https://example.com/webhook",
             Secret = "secret",
-            IsActive = true
+            IsActive = true,
+            MaxRetries = 5
         };
 
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
-        _subscriptionStore.GetByEventTypeAsync("order.placed", Arg.Any<CancellationToken>())
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
         _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
@@ -231,6 +253,7 @@ public class OutboxProcessingPipelineTests
     {
         SetupLockHeld();
         SetupMarkAsDeadLettered();
+        SetupNoSuccessfulDelivery();
 
         var message = new OutboxMessage
         {
@@ -248,27 +271,27 @@ public class OutboxProcessingPipelineTests
             EventType = "order.placed",
             WebhookUrl = "https://example.com/webhook",
             Secret = "secret",
-            IsActive = true
+            IsActive = true,
+            MaxRetries = 5
         };
 
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
-        _subscriptionStore.GetByEventTypeAsync("order.placed", Arg.Any<CancellationToken>())
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
+        // Attempt count > MaxRetries means this subscription is exhausted.
         _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
-            .Returns(5);
-
-        _webhookDeliverer.DeliverAsync(message, subscription, Arg.Any<CancellationToken>())
-            .Returns(new DeliveryResult(false, 500, "Error", "HTTP 500", 100));
+            .Returns(6); // > MaxRetries(5) → skipped
 
         _retryPolicy.GetNextDelay(5).Returns((TimeSpan?)null);
 
         var pipeline = CreatePipeline();
         await pipeline.ProcessBatchAsync();
 
-        await _outboxStore.Received(1).MarkAsDeadLetteredAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        // All subscriptions skipped (exhausted) → allDone=true, anyPending=false → mark processed
+        await _outboxStore.Received(1).MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -276,6 +299,7 @@ public class OutboxProcessingPipelineTests
     {
         SetupLockHeld();
         SetupIncrementRetry();
+        SetupNoSuccessfulDelivery();
 
         var message = new OutboxMessage
         {
@@ -286,13 +310,13 @@ public class OutboxProcessingPipelineTests
             CreatedAt = DateTimeOffset.UtcNow
         };
 
-        var sub1 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://a.com", Secret = "s1", IsActive = true };
-        var sub2 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://b.com", Secret = "s2", IsActive = true };
+        var sub1 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://a.com", Secret = "s1", IsActive = true, MaxRetries = 5 };
+        var sub2 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://b.com", Secret = "s2", IsActive = true, MaxRetries = 5 };
 
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
-        _subscriptionStore.GetByEventTypeAsync("order.placed", Arg.Any<CancellationToken>())
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { sub1, sub2 });
 
         _deliveryAttemptStore.GetAttemptCountAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<CancellationToken>()).Returns(0);
@@ -312,5 +336,48 @@ public class OutboxProcessingPipelineTests
         await _outboxStore.DidNotReceive().MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
         // Should increment retry
         await _outboxStore.Received(1).IncrementRetryAsync(message.Id, Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProcessBatchAsync_AlreadySucceededSubscription_IsSkipped()
+    {
+        SetupLockHeld();
+        SetupMarkAsProcessed();
+
+        var message = new OutboxMessage
+        {
+            Id = Guid.NewGuid(),
+            EventType = "order.placed",
+            Payload = "{}",
+            Status = MessageStatus.Processing,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        var subscription = new WebhookSubscription
+        {
+            Id = Guid.NewGuid(),
+            EventType = "order.placed",
+            WebhookUrl = "https://example.com/webhook",
+            Secret = "secret",
+            IsActive = true
+        };
+
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(new List<OutboxMessage> { message });
+
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
+            .Returns(new List<WebhookSubscription> { subscription });
+
+        // This subscription already succeeded previously (#7 fix).
+        _deliveryAttemptStore.HasSuccessfulDeliveryAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        var pipeline = CreatePipeline();
+        await pipeline.ProcessBatchAsync();
+
+        // Delivery should be skipped
+        await _webhookDeliverer.DidNotReceive().DeliverAsync(Arg.Any<OutboxMessage>(), Arg.Any<WebhookSubscription>(), Arg.Any<CancellationToken>());
+        // All done (skipped), so mark processed
+        await _outboxStore.Received(1).MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 }

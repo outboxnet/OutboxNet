@@ -14,6 +14,7 @@ public class WebhookSubscriptionConfiguration : IEntityTypeConfiguration<Webhook
         builder.HasKey(s => s.Id);
         builder.Property(s => s.Id).HasDefaultValueSql("NEWSEQUENTIALID()");
 
+        builder.Property(s => s.TenantId).HasMaxLength(256);
         builder.Property(s => s.EventType).IsRequired().HasMaxLength(256);
         builder.Property(s => s.WebhookUrl).IsRequired().HasMaxLength(2048);
         builder.Property(s => s.Secret).IsRequired().HasMaxLength(512);
@@ -35,5 +36,9 @@ public class WebhookSubscriptionConfiguration : IEntityTypeConfiguration<Webhook
 
         builder.HasIndex(s => new { s.EventType, s.IsActive })
             .HasDatabaseName("IX_WebhookSubscriptions_EventType_Active");
+
+        builder.HasIndex(s => new { s.TenantId, s.IsActive })
+            .HasDatabaseName("IX_WebhookSubscriptions_TenantId_Active")
+            .HasFilter("[TenantId] IS NOT NULL");
     }
 }

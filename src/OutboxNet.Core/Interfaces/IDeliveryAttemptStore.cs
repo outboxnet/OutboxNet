@@ -14,4 +14,18 @@ public interface IDeliveryAttemptStore
         CancellationToken ct = default);
 
     Task<int> GetAttemptCountAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns <c>true</c> if there is at least one successful delivery attempt
+    /// for the given message + subscription pair.
+    /// Used to skip re-delivering to subscriptions that already succeeded on a previous attempt.
+    /// </summary>
+    Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes delivery attempt records whose <c>AttemptedAt</c> is older than
+    /// <paramref name="olderThan"/>. Returns the number of rows deleted.
+    /// Call periodically (e.g. nightly) to prevent unbounded table growth.
+    /// </summary>
+    Task<int> PurgeOldAttemptsAsync(DateTimeOffset olderThan, CancellationToken ct = default);
 }

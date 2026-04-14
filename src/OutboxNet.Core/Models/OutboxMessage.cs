@@ -16,4 +16,7 @@ public class OutboxMessage
     public DateTimeOffset? NextRetryAt { get; set; }
     public string? LastError { get; set; }
     public Dictionary<string, string>? Headers { get; set; }
+    public string? TenantId { get; set; }
+    public string? UserId { get; set; }
+    public string? EntityId { get; set; }
 }

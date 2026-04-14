@@ -45,6 +45,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             request.Headers.Add("X-Outbox-Signature", signature);
             request.Headers.Add("X-Outbox-Event", message.EventType);
             request.Headers.Add("X-Outbox-Delivery-Id", deliveryId.ToString());
+            request.Headers.Add("X-Outbox-Message-Id", message.Id.ToString());
             request.Headers.Add("X-Outbox-Timestamp", timestamp);
 
             if (message.CorrelationId is not null)
@@ -91,7 +92,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             activity?.SetTag("http.status_code", statusCode);
             activity?.SetTag("outbox.delivery.success", success);
 
-            return new DeliveryResult(success, statusCode, responseBody, success ? null : $"HTTP {statusCode}", stopwatch.Elapsed.Milliseconds);
+            return new DeliveryResult(success, statusCode, responseBody, success ? null : $"HTTP {statusCode}", stopwatch.ElapsedMilliseconds);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -102,7 +103,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             _logger.LogWarning("Webhook delivery timed out to {Url} for message {MessageId} after {Timeout}s",
                 subscription.WebhookUrl, message.Id, subscription.Timeout.TotalSeconds);
 
-            return new DeliveryResult(false, null, null, "Request timed out", stopwatch.Elapsed.Milliseconds);
+            return new DeliveryResult(false, null, null, "Request timed out", stopwatch.ElapsedMilliseconds);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -113,7 +114,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             _logger.LogError(ex, "Webhook delivery failed to {Url} for message {MessageId}",
                 subscription.WebhookUrl, message.Id);
 
-            return new DeliveryResult(false, null, null, ex.Message, stopwatch.Elapsed.Milliseconds);
+            return new DeliveryResult(false, null, null, ex.Message, stopwatch.ElapsedMilliseconds);
         }
     }
 }

@@ -97,6 +97,10 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
                         .HasColumnType("datetimeoffset(3)")
                         .HasDefaultValueSql("SYSDATETIMEOFFSET()");
 
+                    b.Property<string>("EntityId")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
                     b.Property<string>("EventType")
                         .IsRequired()
                         .HasMaxLength(256)
@@ -136,14 +140,30 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
                     b.Property<int>("Status")
                         .HasColumnType("int");
 
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
                     b.Property<string>("TraceId")
                         .HasMaxLength(128)
                         .HasColumnType("nvarchar(128)");
+
+                    b.Property<string>("UserId")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
 
                     b.HasKey("Id");
 
                     b.HasIndex("CreatedAt")
                         .HasDatabaseName("IX_OutboxMessages_CreatedAt");
+
+                    b.HasIndex("Status", "LockedUntil")
+                        .HasDatabaseName("IX_OutboxMessages_Status_LockedUntil")
+                        .HasFilter("[LockedUntil] IS NOT NULL");
+
+                    b.HasIndex("EntityId", "TenantId", "UserId")
+                        .HasDatabaseName("IX_OutboxMessages_PartitionKey")
+                        .HasFilter("[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
 
                     b.HasIndex("EventType")
                         .HasDatabaseName("IX_OutboxMessages_EventType");
@@ -172,6 +192,10 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
 
                     b.Property<string>("EventType")
                         .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("TenantId")
                         .HasMaxLength(256)
                         .HasColumnType("nvarchar(256)");
 
@@ -207,6 +231,10 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
 
                     b.HasIndex("EventType", "IsActive")
                         .HasDatabaseName("IX_WebhookSubscriptions_EventType_Active");
+
+                    b.HasIndex("TenantId", "IsActive")
+                        .HasDatabaseName("IX_WebhookSubscriptions_TenantId_Active")
+                        .HasFilter("[TenantId] IS NOT NULL");
 
                     b.ToTable("WebhookSubscriptions", "outbox");
                 });

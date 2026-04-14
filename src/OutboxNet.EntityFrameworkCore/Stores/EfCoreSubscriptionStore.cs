@@ -7,10 +7,14 @@ namespace OutboxNet.EntityFrameworkCore.Stores;
 internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
 {
     private readonly OutboxDbContext _dbContext;
+    private readonly ITenantSecretRetriever? _secretRetriever;
 
-    public EfCoreSubscriptionStore(OutboxDbContext dbContext)
+    public EfCoreSubscriptionStore(
+        OutboxDbContext dbContext,
+        ITenantSecretRetriever? secretRetriever = null)
     {
         _dbContext = dbContext;
+        _secretRetriever = secretRetriever;
     }
 
     public async Task<WebhookSubscription> AddAsync(WebhookSubscription subscription, CancellationToken ct = default)
@@ -34,6 +38,21 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
             .ToListAsync(ct);
     }
 
+    public async Task<IReadOnlyList<WebhookSubscription>> GetForMessageAsync(OutboxMessage message, CancellationToken ct = default)
+    {
+        var tenantId = message.TenantId;
+
+        // Global subscriptions (TenantId IS NULL) always match.
+        // Tenant-specific subscriptions match only when TenantId equals the message's TenantId.
+        var subscriptions = await _dbContext.WebhookSubscriptions
+            .Where(s => s.IsActive
+                     && (s.EventType == message.EventType || s.EventType == "*")
+                     && (s.TenantId == null || s.TenantId == tenantId))
+            .ToListAsync(ct);
+
+        return await EnrichSecretsAsync(subscriptions, ct);
+    }
+
     public async Task UpdateAsync(WebhookSubscription subscription, CancellationToken ct = default)
     {
         subscription.UpdatedAt = DateTimeOffset.UtcNow;
@@ -48,5 +67,23 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
             .ExecuteUpdateAsync(s => s
                 .SetProperty(x => x.IsActive, false)
                 .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow), ct);
+    }
+
+    private async Task<IReadOnlyList<WebhookSubscription>> EnrichSecretsAsync(
+        List<WebhookSubscription> subscriptions,
+        CancellationToken ct)
+    {
+        if (_secretRetriever is null || subscriptions.Count == 0)
+            return subscriptions;
+
+        foreach (var sub in subscriptions)
+        {
+            var tenantKey = sub.TenantId ?? sub.Id.ToString();
+            var secret = await _secretRetriever.GetSecretAsync(tenantKey, ct);
+            if (secret is not null)
+                sub.Secret = secret;
+        }
+
+        return subscriptions;
     }
 }

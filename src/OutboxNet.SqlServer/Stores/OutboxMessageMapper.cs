@@ -27,7 +27,10 @@ internal static class OutboxMessageMapper
             LockedBy = reader.IsDBNull(reader.GetOrdinal("LockedBy")) ? null : reader.GetString(reader.GetOrdinal("LockedBy")),
             NextRetryAt = reader.IsDBNull(reader.GetOrdinal("NextRetryAt")) ? null : reader.GetDateTimeOffset(reader.GetOrdinal("NextRetryAt")),
             LastError = reader.IsDBNull(reader.GetOrdinal("LastError")) ? null : reader.GetString(reader.GetOrdinal("LastError")),
-            Headers = headersJson == null ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(headersJson)
+            Headers = headersJson == null ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(headersJson),
+            TenantId = reader.IsDBNull(reader.GetOrdinal("TenantId")) ? null : reader.GetString(reader.GetOrdinal("TenantId")),
+            UserId = reader.IsDBNull(reader.GetOrdinal("UserId")) ? null : reader.GetString(reader.GetOrdinal("UserId")),
+            EntityId = reader.IsDBNull(reader.GetOrdinal("EntityId")) ? null : reader.GetString(reader.GetOrdinal("EntityId"))
         };
     }
 
@@ -40,6 +43,7 @@ internal static class OutboxMessageMapper
         return new WebhookSubscription
         {
             Id = reader.GetGuid(reader.GetOrdinal("Id")),
+            TenantId = reader.IsDBNull(reader.GetOrdinal("TenantId")) ? null : reader.GetString(reader.GetOrdinal("TenantId")),
             EventType = reader.GetString(reader.GetOrdinal("EventType")),
             WebhookUrl = reader.GetString(reader.GetOrdinal("WebhookUrl")),
             Secret = reader.GetString(reader.GetOrdinal("Secret")),

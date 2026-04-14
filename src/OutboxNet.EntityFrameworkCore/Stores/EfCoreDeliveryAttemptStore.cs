@@ -45,4 +45,19 @@ internal sealed class EfCoreDeliveryAttemptStore : IDeliveryAttemptStore
             .CountAsync(d => d.OutboxMessageId == messageId
                           && d.WebhookSubscriptionId == subscriptionId, ct);
     }
+
+    public async Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
+    {
+        return await _dbContext.DeliveryAttempts
+            .AnyAsync(d => d.OutboxMessageId == messageId
+                        && d.WebhookSubscriptionId == subscriptionId
+                        && d.Status == DeliveryStatus.Success, ct);
+    }
+
+    public async Task<int> PurgeOldAttemptsAsync(DateTimeOffset olderThan, CancellationToken ct = default)
+    {
+        return await _dbContext.DeliveryAttempts
+            .Where(d => d.AttemptedAt < olderThan)
+            .ExecuteDeleteAsync(ct);
+    }
 }

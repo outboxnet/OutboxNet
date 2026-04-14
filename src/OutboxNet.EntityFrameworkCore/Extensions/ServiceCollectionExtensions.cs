@@ -33,7 +33,9 @@ public static class ServiceCollectionExtensions
         });
 
         builder.Services.AddScoped<IOutboxStore, EfCoreOutboxStore>();
-        builder.Services.AddScoped<ISubscriptionStore, EfCoreSubscriptionStore>();
+        builder.Services.AddScoped<EfCoreSubscriptionStore>();
+        builder.Services.AddScoped<ISubscriptionStore>(sp => sp.GetRequiredService<EfCoreSubscriptionStore>());
+        builder.Services.AddScoped<ISubscriptionReader>(sp => sp.GetRequiredService<EfCoreSubscriptionStore>());
         builder.Services.AddScoped<IDeliveryAttemptStore, EfCoreDeliveryAttemptStore>();
         builder.Services.AddScoped<IOutboxPublisher, EfCoreOutboxPublisher<TDbContext>>();
 

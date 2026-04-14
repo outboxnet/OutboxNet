@@ -129,4 +129,44 @@ internal sealed class DirectSqlDeliveryAttemptStore : IDeliveryAttemptStore
 
         return (int)(await command.ExecuteScalarAsync(ct))!;
     }
+
+    public async Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
+    {
+        var sql = $"""
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM [{_schema}].[DeliveryAttempts]
+                WHERE [OutboxMessageId] = @OutboxMessageId
+                  AND [WebhookSubscriptionId] = @WebhookSubscriptionId
+                  AND [Status] = @SuccessStatus
+            ) THEN 1 ELSE 0 END
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.Add(new SqlParameter("@OutboxMessageId", SqlDbType.UniqueIdentifier) { Value = messageId });
+        command.Parameters.Add(new SqlParameter("@WebhookSubscriptionId", SqlDbType.UniqueIdentifier) { Value = subscriptionId });
+        command.Parameters.Add(new SqlParameter("@SuccessStatus", SqlDbType.Int) { Value = (int)DeliveryStatus.Success });
+
+        return (int)(await command.ExecuteScalarAsync(ct))! == 1;
+    }
+
+    public async Task<int> PurgeOldAttemptsAsync(DateTimeOffset olderThan, CancellationToken ct = default)
+    {
+        var sql = $"""
+            DELETE FROM [{_schema}].[DeliveryAttempts]
+            WHERE [AttemptedAt] < @OlderThan
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.Add(new SqlParameter("@OlderThan", SqlDbType.DateTimeOffset) { Value = olderThan });
+
+        return await command.ExecuteNonQueryAsync(ct);
+    }
 }

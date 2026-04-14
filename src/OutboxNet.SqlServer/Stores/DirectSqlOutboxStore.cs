@@ -29,9 +29,9 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         var schema = _options.SchemaName;
         var sql = $"""
             INSERT INTO [{schema}].[OutboxMessages]
-                ([Id], [EventType], [Payload], [CorrelationId], [TraceId], [Status], [RetryCount], [CreatedAt], [Headers])
+                ([Id], [EventType], [Payload], [CorrelationId], [TraceId], [Status], [RetryCount], [CreatedAt], [Headers], [TenantId], [UserId], [EntityId])
             VALUES
-                (@Id, @EventType, @Payload, @CorrelationId, @TraceId, @Status, @RetryCount, @CreatedAt, @Headers)
+                (@Id, @EventType, @Payload, @CorrelationId, @TraceId, @Status, @RetryCount, @CreatedAt, @Headers, @TenantId, @UserId, @EntityId)
             """;
 
         await using var connection = new SqlConnection(_connectionString);
@@ -53,6 +53,9 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
                 ? (object)System.Text.Json.JsonSerializer.Serialize(message.Headers)
                 : DBNull.Value
         });
+        command.Parameters.Add(new SqlParameter("@TenantId", SqlDbType.NVarChar, 256) { Value = (object?)message.TenantId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@UserId", SqlDbType.NVarChar, 256) { Value = (object?)message.UserId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@EntityId", SqlDbType.NVarChar, 256) { Value = (object?)message.EntityId ?? DBNull.Value });
 
         await command.ExecuteNonQueryAsync(ct);
     }
@@ -64,8 +67,44 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         CancellationToken ct = default)
     {
         var schema = _options.SchemaName;
+
+        var tenantFilterClause = _options.TenantFilter is not null
+            ? "AND m.[TenantId] = @TenantFilter"
+            : string.Empty;
+
+        // Null-safe partition equality: (a = b) OR (a IS NULL AND b IS NULL)
+        var orderingClause = _options.EnableOrderedProcessing
+            ? $"""
+
+              AND (
+                (m.[TenantId] IS NULL AND m.[UserId] IS NULL AND m.[EntityId] IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (NOLOCK)
+                    WHERE m2.[Status] = @ProcessingStatus
+                      AND m2.[LockedUntil] > SYSDATETIMEOFFSET()
+                      AND (m2.[TenantId] = m.[TenantId] OR (m2.[TenantId] IS NULL AND m.[TenantId] IS NULL))
+                      AND (m2.[UserId]   = m.[UserId]   OR (m2.[UserId]   IS NULL AND m.[UserId]   IS NULL))
+                      AND (m2.[EntityId] = m.[EntityId] OR (m2.[EntityId] IS NULL AND m.[EntityId] IS NULL))
+                      AND m2.[Id] != m.[Id]
+                )
+              )
+              """
+            : string.Empty;
+
+        // Use a CTE to guarantee ORDER BY is respected when selecting the batch.
+        // Plain UPDATE TOP(n) ... ORDER BY does not guarantee which rows are picked.
         var sql = $"""
-            UPDATE TOP (@BatchSize) m
+            WITH Candidates AS (
+                SELECT TOP (@BatchSize) m.[Id]
+                FROM [{schema}].[OutboxMessages] m WITH (UPDLOCK, READPAST)
+                WHERE m.[Status] IN (@PendingStatus, @ProcessingStatus)
+                  AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
+                  AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
+                  {tenantFilterClause}
+                {orderingClause}
+                ORDER BY m.[CreatedAt]
+            )
+            UPDATE m
             SET m.[Status] = @ProcessingStatus,
                 m.[LockedUntil] = DATEADD(SECOND, @VisibilityTimeoutSeconds, SYSDATETIMEOFFSET()),
                 m.[LockedBy] = @LockedBy
@@ -83,11 +122,12 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
                 INSERTED.[LockedBy],
                 INSERTED.[NextRetryAt],
                 INSERTED.[LastError],
-                INSERTED.[Headers]
-            FROM [{schema}].[OutboxMessages] m WITH (UPDLOCK, READPAST)
-            WHERE m.[Status] IN (@PendingStatus, @ProcessingStatus)
-              AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
-              AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
+                INSERTED.[Headers],
+                INSERTED.[TenantId],
+                INSERTED.[UserId],
+                INSERTED.[EntityId]
+            FROM [{schema}].[OutboxMessages] m
+            INNER JOIN Candidates c ON c.[Id] = m.[Id]
             """;
 
         await using var connection = new SqlConnection(_connectionString);
@@ -100,6 +140,7 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         command.Parameters.Add(new SqlParameter("@PendingStatus", SqlDbType.Int) { Value = (int)MessageStatus.Pending });
         command.Parameters.Add(new SqlParameter("@VisibilityTimeoutSeconds", SqlDbType.Int) { Value = (int)visibilityTimeout.TotalSeconds });
         command.Parameters.Add(new SqlParameter("@LockedBy", SqlDbType.NVarChar, 256) { Value = lockedBy });
+        command.Parameters.Add(new SqlParameter("@TenantFilter", SqlDbType.NVarChar, 256) { Value = (object?)_options.TenantFilter ?? DBNull.Value });
 
         var messages = new List<OutboxMessage>();
 
@@ -245,6 +286,7 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         var sql = $"""
             UPDATE [{schema}].[OutboxMessages]
             SET [Status] = @PendingStatus,
+                [RetryCount] = [RetryCount] + 1,
                 [LockedUntil] = NULL,
                 [LockedBy] = NULL
             WHERE [Status] = @ProcessingStatus

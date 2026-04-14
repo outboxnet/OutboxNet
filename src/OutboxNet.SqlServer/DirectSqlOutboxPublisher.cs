@@ -14,17 +14,20 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
 {
     private readonly ISqlTransactionAccessor _transactionAccessor;
     private readonly IMessageSerializer _serializer;
+    private readonly IOutboxContextAccessor _contextAccessor;
     private readonly OutboxOptions _options;
     private readonly ILogger<DirectSqlOutboxPublisher> _logger;
 
     public DirectSqlOutboxPublisher(
         ISqlTransactionAccessor transactionAccessor,
         IMessageSerializer serializer,
+        IOutboxContextAccessor contextAccessor,
         IOptions<OutboxOptions> options,
         ILogger<DirectSqlOutboxPublisher> logger)
     {
         _transactionAccessor = transactionAccessor;
         _serializer = serializer;
+        _contextAccessor = contextAccessor;
         _options = options.Value;
         _logger = logger;
     }
@@ -33,6 +36,7 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
         string eventType,
         object payload,
         string? correlationId = null,
+        string? entityId = null,
         Dictionary<string, string>? headers = null,
         CancellationToken cancellationToken = default)
     {
@@ -50,9 +54,9 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
 
         var sql = $"""
             INSERT INTO [{schema}].[OutboxMessages]
-                ([Id], [EventType], [Payload], [CorrelationId], [TraceId], [Status], [RetryCount], [CreatedAt], [Headers])
+                ([Id], [EventType], [Payload], [CorrelationId], [TraceId], [Status], [RetryCount], [CreatedAt], [Headers], [TenantId], [UserId], [EntityId])
             VALUES
-                (@Id, @EventType, @Payload, @CorrelationId, @TraceId, @Status, 0, SYSDATETIMEOFFSET(), @Headers)
+                (@Id, @EventType, @Payload, @CorrelationId, @TraceId, @Status, 0, SYSDATETIMEOFFSET(), @Headers, @TenantId, @UserId, @EntityId)
             """;
 
         await using var command = connection.CreateCommand();
@@ -67,6 +71,9 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
         command.Parameters.Add(new SqlParameter("@TraceId", SqlDbType.NVarChar, 128) { Value = (object?)traceId ?? DBNull.Value });
         command.Parameters.Add(new SqlParameter("@Status", SqlDbType.Int) { Value = (int)MessageStatus.Pending });
         command.Parameters.Add(new SqlParameter("@Headers", SqlDbType.NVarChar, -1) { Value = (object?)headersJson ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@TenantId", SqlDbType.NVarChar, 256) { Value = (object?)_contextAccessor.TenantId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@UserId", SqlDbType.NVarChar, 256) { Value = (object?)_contextAccessor.UserId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@EntityId", SqlDbType.NVarChar, 256) { Value = (object?)entityId ?? DBNull.Value });
 
         await command.ExecuteNonQueryAsync(cancellationToken);
 
