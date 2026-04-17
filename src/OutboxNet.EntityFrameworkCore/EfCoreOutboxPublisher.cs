@@ -97,6 +97,6 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         // Wake the processor immediately — eliminates polling-interval latency for the
         // first message after an idle period. The signal is fire-and-forget; it does not
         // affect the transactional guarantee (message is already committed).
-        _signal.Notify();
+        _signal.Notify(messageId);
     }
 }

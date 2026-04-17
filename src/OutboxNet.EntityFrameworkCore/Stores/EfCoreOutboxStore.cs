@@ -35,13 +35,23 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
        int batchSize,
        TimeSpan visibilityTimeout,
        string lockedBy,
+       IReadOnlySet<Guid>? skipIds = null,
        CancellationToken ct = default)
     {
         var schema = _options.SchemaName;
-        var lockedUntil = DateTimeOffset.UtcNow.Add(visibilityTimeout);
+        var visibilityTimeoutSeconds = (int)visibilityTimeout.TotalSeconds;
 
         var tenantFilterClause = _options.TenantFilter is not null
             ? "AND m.[TenantId] = @tenantFilter"
+            : string.Empty;
+
+        // Exclude IDs currently being processed by the hot path on this instance.
+        // Prevents a cold-path lock attempt from racing against a concurrent hot-path
+        // TryLockByIdAsync for the same row. The DB lock gate (UPDLOCK + READPAST)
+        // already makes dual delivery impossible, but this eliminates the wasted
+        // round-trip entirely.
+        var skipIdsClause = skipIds is { Count: > 0 }
+            ? "AND m.[Id] NOT IN (SELECT CAST([value] AS uniqueidentifier) FROM OPENJSON(@skipJson))"
             : string.Empty;
 
         // Null-safe partition equality: (a = b) OR (a IS NULL AND b IS NULL)
@@ -51,7 +61,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
               AND (
                 (m.[TenantId] IS NULL AND m.[UserId] IS NULL AND m.[EntityId] IS NULL)
                 OR NOT EXISTS (
-                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (NOLOCK)
+                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (READCOMMITTEDLOCK)
                     WHERE m2.[Status] = @processingStatus
                       AND m2.[LockedUntil] > SYSDATETIMEOFFSET()
                       AND (m2.[TenantId] = m.[TenantId] OR (m2.[TenantId] IS NULL AND m.[TenantId] IS NULL))
@@ -73,13 +83,14 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                   AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
                   AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
                   {tenantFilterClause}
+                  {skipIdsClause}
                 {orderingClause}
                 ORDER BY m.[CreatedAt]
             )
             UPDATE m
             SET
                 m.[Status] = @processingStatus,
-                m.[LockedUntil] = @lockedUntil,
+                m.[LockedUntil] = DATEADD(SECOND, @visibilityTimeoutSeconds, SYSDATETIMEOFFSET()),
                 m.[LockedBy] = @lockedBy
             OUTPUT
                 INSERTED.[Id],
@@ -108,15 +119,19 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         // which corrupts binding for all subsequent parameters (@pendingStatus, etc.).
         var sqlParams = new List<SqlParameter>
         {
-            new SqlParameter("@batchSize",       SqlDbType.Int) { Value = batchSize },
-            new SqlParameter("@processingStatus", SqlDbType.Int) { Value = (int)MessageStatus.Processing },
-            new SqlParameter("@pendingStatus",    SqlDbType.Int) { Value = (int)MessageStatus.Pending },
-            new SqlParameter("@lockedUntil",      SqlDbType.DateTimeOffset) { Value = lockedUntil },
-            new SqlParameter("@lockedBy",         SqlDbType.NVarChar, 256) { Value = lockedBy },
+            new SqlParameter("@batchSize",              SqlDbType.Int)      { Value = batchSize },
+            new SqlParameter("@processingStatus",       SqlDbType.Int)      { Value = (int)MessageStatus.Processing },
+            new SqlParameter("@pendingStatus",          SqlDbType.Int)      { Value = (int)MessageStatus.Pending },
+            new SqlParameter("@visibilityTimeoutSeconds", SqlDbType.Int)    { Value = visibilityTimeoutSeconds },
+            new SqlParameter("@lockedBy",               SqlDbType.NVarChar, 256) { Value = lockedBy },
         };
 
         if (_options.TenantFilter is not null)
             sqlParams.Add(new SqlParameter("@tenantFilter", SqlDbType.NVarChar, 256) { Value = _options.TenantFilter });
+
+        if (skipIds is { Count: > 0 })
+            sqlParams.Add(new SqlParameter("@skipJson", SqlDbType.NVarChar, -1)
+                { Value = System.Text.Json.JsonSerializer.Serialize(skipIds) });
 
         var messages = await _dbContext.OutboxMessages
             .FromSqlRaw(sql, sqlParams.ToArray<object>())
@@ -129,6 +144,50 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             lockedBy);
 
         return messages;
+    }
+
+    public async Task<OutboxMessage?> TryLockByIdAsync(
+        Guid messageId,
+        TimeSpan visibilityTimeout,
+        string lockedBy,
+        CancellationToken ct = default)
+    {
+        var schema = _options.SchemaName;
+        var timeoutSeconds = (int)visibilityTimeout.TotalSeconds;
+
+        // PK-seek UPDATE — no table scan. SQL Server blocks on an uncommitted INSERT
+        // for this ID (read-committed), so the signal racing ahead of the commit is safe:
+        // the UPDATE succeeds when the outer transaction commits, or returns 0 rows if
+        // it rolls back.
+        var sql = $"""
+            UPDATE [{schema}].[OutboxMessages]
+            SET [Status]      = @processingStatus,
+                [LockedUntil] = DATEADD(SECOND, @timeoutSeconds, SYSDATETIMEOFFSET()),
+                [LockedBy]    = @lockedBy
+            OUTPUT
+                INSERTED.[Id], INSERTED.[EventType], INSERTED.[Payload],
+                INSERTED.[CorrelationId], INSERTED.[TraceId], INSERTED.[Status],
+                INSERTED.[RetryCount], INSERTED.[CreatedAt], INSERTED.[ProcessedAt],
+                INSERTED.[LockedUntil], INSERTED.[LockedBy], INSERTED.[NextRetryAt],
+                INSERTED.[LastError], INSERTED.[Headers],
+                INSERTED.[TenantId], INSERTED.[UserId], INSERTED.[EntityId]
+            WHERE [Id]     = @id
+              AND [Status] = @pendingStatus
+              AND ([LockedUntil] IS NULL OR [LockedUntil] < SYSDATETIMEOFFSET())
+              AND ([NextRetryAt] IS NULL OR [NextRetryAt] <= SYSDATETIMEOFFSET())
+            """;
+
+        var results = await _dbContext.OutboxMessages
+            .FromSqlRaw(sql,
+                new SqlParameter("@id",               SqlDbType.UniqueIdentifier) { Value = messageId },
+                new SqlParameter("@processingStatus", SqlDbType.Int)              { Value = (int)MessageStatus.Processing },
+                new SqlParameter("@pendingStatus",    SqlDbType.Int)              { Value = (int)MessageStatus.Pending },
+                new SqlParameter("@timeoutSeconds",   SqlDbType.Int)              { Value = timeoutSeconds },
+                new SqlParameter("@lockedBy",         SqlDbType.NVarChar, 256)   { Value = lockedBy })
+            .AsNoTracking()
+            .ToListAsync(ct);
+
+        return results.Count > 0 ? results[0] : null;
     }
 
     public async Task<bool> MarkAsProcessedAsync(Guid messageId, string lockedBy, CancellationToken ct = default)

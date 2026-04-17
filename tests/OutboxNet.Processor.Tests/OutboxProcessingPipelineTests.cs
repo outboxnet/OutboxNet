@@ -80,7 +80,7 @@ public class OutboxProcessingPipelineTests
     [Fact]
     public async Task ProcessBatchAsync_ReleasesExpiredLocks_OnFirstPoll()
     {
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage>());
 
         var pipeline = CreatePipeline();
@@ -93,7 +93,7 @@ public class OutboxProcessingPipelineTests
     [Fact]
     public async Task ProcessBatchAsync_NoMessages_ReturnsZero()
     {
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage>());
 
         var pipeline = CreatePipeline();
@@ -117,7 +117,7 @@ public class OutboxProcessingPipelineTests
             CreatedAt = DateTimeOffset.UtcNow
         };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -153,7 +153,7 @@ public class OutboxProcessingPipelineTests
             IsActive = true
         };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -200,7 +200,7 @@ public class OutboxProcessingPipelineTests
             MaxRetries = 5
         };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -247,7 +247,7 @@ public class OutboxProcessingPipelineTests
             MaxRetries = 5
         };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -282,7 +282,7 @@ public class OutboxProcessingPipelineTests
         var sub1 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://a.com", Secret = "s1", IsActive = true, MaxRetries = 5 };
         var sub2 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://b.com", Secret = "s2", IsActive = true, MaxRetries = 5 };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -328,7 +328,7 @@ public class OutboxProcessingPipelineTests
             IsActive = true
         };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
@@ -364,7 +364,7 @@ public class OutboxProcessingPipelineTests
         var sub1 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://a.com", Secret = "s1", IsActive = true };
         var sub2 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://b.com", Secret = "s2", IsActive = true };
 
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<IReadOnlySet<Guid>?>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage> { message });
 
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())

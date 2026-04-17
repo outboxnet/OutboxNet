@@ -64,12 +64,17 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         int batchSize,
         TimeSpan visibilityTimeout,
         string lockedBy,
+        IReadOnlySet<Guid>? skipIds = null,
         CancellationToken ct = default)
     {
         var schema = _options.SchemaName;
 
         var tenantFilterClause = _options.TenantFilter is not null
             ? "AND m.[TenantId] = @TenantFilter"
+            : string.Empty;
+
+        var skipIdsClause = skipIds is { Count: > 0 }
+            ? "AND m.[Id] NOT IN (SELECT CAST([value] AS uniqueidentifier) FROM OPENJSON(@SkipJson))"
             : string.Empty;
 
         // Null-safe partition equality: (a = b) OR (a IS NULL AND b IS NULL)
@@ -79,7 +84,7 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
               AND (
                 (m.[TenantId] IS NULL AND m.[UserId] IS NULL AND m.[EntityId] IS NULL)
                 OR NOT EXISTS (
-                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (NOLOCK)
+                    SELECT 1 FROM [{schema}].[OutboxMessages] m2 WITH (READCOMMITTEDLOCK)
                     WHERE m2.[Status] = @ProcessingStatus
                       AND m2.[LockedUntil] > SYSDATETIMEOFFSET()
                       AND (m2.[TenantId] = m.[TenantId] OR (m2.[TenantId] IS NULL AND m.[TenantId] IS NULL))
@@ -101,6 +106,7 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
                   AND (m.[LockedUntil] IS NULL OR m.[LockedUntil] < SYSDATETIMEOFFSET())
                   AND (m.[NextRetryAt] IS NULL OR m.[NextRetryAt] <= SYSDATETIMEOFFSET())
                   {tenantFilterClause}
+                  {skipIdsClause}
                 {orderingClause}
                 ORDER BY m.[CreatedAt]
             )
@@ -140,10 +146,13 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         command.Parameters.Add(new SqlParameter("@PendingStatus", SqlDbType.Int) { Value = (int)MessageStatus.Pending });
         command.Parameters.Add(new SqlParameter("@VisibilityTimeoutSeconds", SqlDbType.Int) { Value = (int)visibilityTimeout.TotalSeconds });
         command.Parameters.Add(new SqlParameter("@LockedBy", SqlDbType.NVarChar, 256) { Value = lockedBy });
-        // Only declare @TenantFilter when the clause is actually in the SQL.
+        // Only declare @TenantFilter / @SkipJson when the clauses are actually in the SQL.
         // sp_executesql rejects declared parameters that are not referenced in the query body.
         if (_options.TenantFilter is not null)
             command.Parameters.Add(new SqlParameter("@TenantFilter", SqlDbType.NVarChar, 256) { Value = _options.TenantFilter });
+        if (skipIds is { Count: > 0 })
+            command.Parameters.Add(new SqlParameter("@SkipJson", SqlDbType.NVarChar, -1)
+                { Value = System.Text.Json.JsonSerializer.Serialize(skipIds) });
 
         var messages = new List<OutboxMessage>();
 
@@ -255,6 +264,51 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         command.Parameters.Add(new SqlParameter("@LockedBy", SqlDbType.NVarChar, 256) { Value = lockedBy });
 
         return await command.ExecuteNonQueryAsync(ct) > 0;
+    }
+
+    public async Task<OutboxMessage?> TryLockByIdAsync(
+        Guid messageId,
+        TimeSpan visibilityTimeout,
+        string lockedBy,
+        CancellationToken ct = default)
+    {
+        var schema = _options.SchemaName;
+        var timeoutSeconds = (int)visibilityTimeout.TotalSeconds;
+
+        var sql = $"""
+            UPDATE [{schema}].[OutboxMessages]
+            SET [Status]      = @ProcessingStatus,
+                [LockedUntil] = DATEADD(SECOND, @TimeoutSeconds, SYSDATETIMEOFFSET()),
+                [LockedBy]    = @LockedBy
+            OUTPUT
+                INSERTED.[Id], INSERTED.[EventType], INSERTED.[Payload],
+                INSERTED.[CorrelationId], INSERTED.[TraceId], INSERTED.[Status],
+                INSERTED.[RetryCount], INSERTED.[CreatedAt], INSERTED.[ProcessedAt],
+                INSERTED.[LockedUntil], INSERTED.[LockedBy], INSERTED.[NextRetryAt],
+                INSERTED.[LastError], INSERTED.[Headers],
+                INSERTED.[TenantId], INSERTED.[UserId], INSERTED.[EntityId]
+            WHERE [Id]     = @Id
+              AND [Status] = @PendingStatus
+              AND ([LockedUntil] IS NULL OR [LockedUntil] < SYSDATETIMEOFFSET())
+              AND ([NextRetryAt] IS NULL OR [NextRetryAt] <= SYSDATETIMEOFFSET())
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.Add(new SqlParameter("@Id",               SqlDbType.UniqueIdentifier) { Value = messageId });
+        command.Parameters.Add(new SqlParameter("@ProcessingStatus", SqlDbType.Int)              { Value = (int)MessageStatus.Processing });
+        command.Parameters.Add(new SqlParameter("@PendingStatus",    SqlDbType.Int)              { Value = (int)MessageStatus.Pending });
+        command.Parameters.Add(new SqlParameter("@TimeoutSeconds",   SqlDbType.Int)              { Value = timeoutSeconds });
+        command.Parameters.Add(new SqlParameter("@LockedBy",         SqlDbType.NVarChar, 256)   { Value = lockedBy });
+
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (await reader.ReadAsync(ct))
+            return OutboxMessageMapper.MapFromReader(reader);
+
+        return null;
     }
 
     public async Task<bool> IsLockHeldAsync(Guid messageId, string lockedBy, CancellationToken ct = default)

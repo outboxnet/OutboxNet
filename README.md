@@ -34,12 +34,12 @@ By writing the outbox message in the *same database transaction* as your domain 
 ## Key Features
 
 - **Transactional guarantee** — outbox writes participate in your existing database transaction
-- **Sub-second latency** — publisher signals the processor on commit; no polling delay for the first delivery after idle
+- **Sub-millisecond same-instance latency** — hot path drains a `Channel<Guid>` as messages are published; cold path handles cross-instance messages within one polling interval (default 1 s)
+- **Duplicate-safe multi-instance delivery** — DB-level PK-seek `UPDATE WHERE Status=Pending` is the lock gate; only one instance wins per message, across any number of replicas
+- **No hot+cold race** — in-flight hot-path IDs are excluded from the cold-path SQL query via `OPENJSON NOT IN`; no wasted lock attempts within the same process
 - **Duplicate-safe delivery** — deterministic `X-Outbox-Delivery-Id` per attempt; processor tracks per-subscription success to skip already-delivered subscriptions on retry
-- **Multi-instance safe** — visibility-timeout locking prevents two instances processing the same message
 - **Parallel delivery** — configurable concurrency at both the message and subscription level
 - **HMAC-SHA256 webhook signing** — receivers can verify payload authenticity
-- **Adaptive exponential backoff** — idle queue backs off automatically; saturated queue drains with zero delay
 - **Dead-letter queue** — exhausted messages are preserved for manual review
 - **Per-subscription settings** — independent retry limit, timeout, and custom headers per endpoint
 - **Multi-tenant** — per-tenant webhook routing, per-tenant secrets, ambient `TenantId`/`UserId` from HTTP context
@@ -365,47 +365,271 @@ await _cache.SetAsync(idempotencyKey, true, TimeSpan.FromDays(7));
 return Ok();
 ```
 
-## How It Works
+## Architecture
+
+### Hot Path and Cold Path
+
+OutboxNet runs two concurrent processing loops inside every host instance. They have different responsibilities and are designed to complement each other, not compete.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Your Application                             │
-│                                                                     │
-│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐  │
-│  │ Domain Logic  │───>│ IOutboxPublisher  │───>│   SQL Server DB  │  │
-│  │ (e.g. Order)  │    │ (same transaction)│    │  ┌────────────┐ │  │
-│  └──────────────┘    └────────┬─────────┘    │  │  Orders     │ │  │
-│                               │ Notify()      │  │  OutboxMsgs │ │  │
-│                               ▼              │  └────────────┘ │  │
-│                        IOutboxSignal          └────────┬────────┘  │
-│                               │                        │           │
-│  ┌────────────────────────────▼───────────────────────┐│           │
-│  │           OutboxProcessorService                    ││           │
-│  │  WaitAsync(signal or timeout)                       ││           │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ││           │
-│  │  │ LockNextBatch │─>│ Deliver (par)│─>│ Bookkeep │  ││           │
-│  │  │ per batch     │  │ per sub (par)│  │ + Decide │  ││           │
-│  │  └──────────────┘  └──────────────┘  └──────────┘  ││           │
-│  └─────────────────────────────────────────────────────┘│           │
-│                                                          │           │
-└──────────────────────────────────────────────────────────┘           │
-                               │
-                    ┌──────────▼──────────┐
-                    │  External Webhooks   │
-                    │  • Payment Service   │
-                    │  • Inventory Service │
-                    │  • Analytics         │
-                    └─────────────────────┘
+  YOUR APPLICATION INSTANCE
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                          │
+  │  ┌─────────────────┐  BEGIN TX                                          │
+  │  │  Domain Logic   │──────────────────────────────────────────────┐     │
+  │  │  (API handler,  │                                              │     │
+  │  │   job, etc.)    │                                              ▼     │
+  │  └─────────────────┘                                    ┌──────────────┐ │
+  │                                                         │  SQL Server  │ │
+  │  ┌─────────────────┐  (same TX, atomic)                │              │ │
+  │  │ IOutboxPublisher│──── INSERT OutboxMessage ─────────>│  Orders      │ │
+  │  │                 │                                    │  OutboxMsgs  │ │
+  │  │  after COMMIT:  │                                    │  (Pending)   │ │
+  │  │  Notify(msgId)  │                                    └──────┬───────┘ │
+  │  └────────┬────────┘                                          │         │
+  │           │                                                   │         │
+  │           ▼  Channel<Guid>  capacity=10 000, DropOldest       │         │
+  │  ┌─────────────────────────────────────────────────────────┐  │         │
+  │  │              OutboxProcessorService                     │  │         │
+  │  │                                                         │  │         │
+  │  │  ┌──────────────────────────────────────────────────┐   │  │         │
+  │  │  │  HOT PATH  (Task 1)                              │   │  │         │
+  │  │  │                                                  │   │  │         │
+  │  │  │  Parallel.ForEachAsync(channel.ReadAllAsync())   │   │  │         │
+  │  │  │    ├─ mark ID as in-flight                       │   │  │         │
+  │  │  │    ├─ TryLockByIdAsync (PK-seek UPDATE)  ────────┼───┼──┤         │
+  │  │  │    │    WHERE Id=@id AND Status=Pending           │   │  │         │
+  │  │  │    ├─ if locked: fetch subs → deliver → bookkeep │   │  │         │
+  │  │  │    └─ remove from in-flight                       │   │  │         │
+  │  │  │                                                  │   │  │         │
+  │  │  │  Latency: <1 ms from Notify() to lock attempt    │   │  │         │
+  │  │  └──────────────────────────────────────────────────┘   │  │         │
+  │  │                                                         │  │         │
+  │  │  ┌──────────────────────────────────────────────────┐   │  │         │
+  │  │  │  COLD PATH  (Task 2)                             │   │  │         │
+  │  │  │                                                  │   │  │         │
+  │  │  │  loop every ColdPollingInterval (default: 1 s)   │   │  │         │
+  │  │  │    ├─ snapshot in-flight IDs as skipIds           │   │  │         │
+  │  │  │    ├─ LockNextBatchAsync  ───────────────────────┼───┼──┤         │
+  │  │  │    │    WHERE Id NOT IN (skipIds via OPENJSON)    │   │  │         │
+  │  │  │    │    WITH (UPDLOCK, READPAST)                  │   │  │         │
+  │  │  │    └─ fetch subs → deliver (parallel) → bookkeep │   │  │         │
+  │  │  │                                                  │   │  │         │
+  │  │  │  Handles: cross-instance msgs, retries, overflow │   │  │         │
+  │  │  └──────────────────────────────────────────────────┘   │  │         │
+  │  └─────────────────────────────────────────────────────────┘  │         │
+  │                                                               │         │
+  └───────────────────────────────────────────────────────────────┘         │
+                                                                            │
+                                              ┌─────────────────────────────┘
+                                              ▼
+                                   ┌────────────────────┐
+                                   │  External Services  │
+                                   │  • Payment API      │
+                                   │  • Inventory API    │
+                                   │  • Analytics API    │
+                                   └────────────────────┘
 ```
 
-### Processing pipeline (per message)
+#### Hot path — same-instance, sub-millisecond delivery
 
-1. **Lock** — `LockNextBatchAsync` claims messages atomically with a visibility timeout
-2. **Subscription pre-fetch** — one query per unique `(EventType, TenantId)` pair in the batch (not per message)
-3. **Delivery state pre-fetch** — `GetDeliveryStatesAsync` loads `(attemptCount, hasSuccess)` per subscription in one query; already-succeeded subscriptions are skipped
-4. **Parallel delivery** — subscriptions are delivered concurrently up to `MaxConcurrentSubscriptionDeliveries`; each attempt gets a deterministic `deliveryId` derived from `SHA256(MessageId + SubscriptionId + AttemptNumber)`
-5. **Batch bookkeeping** — all `DeliveryAttempt` records saved in a single `SaveAttemptsAsync` call; if save fails after a successful delivery, the processor logs CRITICAL and lets the lock expire (does NOT immediately retry to avoid duplicate delivery)
-6. **Decision** — all succeeded → `MarkAsProcessed`; any failed → `IncrementRetry` with backoff; all exhausted without success → `MarkAsDeadLettered`
+When your code calls `PublishAsync`, the outbox INSERT is part of your database transaction. After the transaction commits, the publisher calls `_signal.Notify(messageId)` — a non-blocking write into a `Channel<Guid>`. The hot path is a `Parallel.ForEachAsync` loop draining that channel continuously.
+
+For each message ID dequeued:
+
+1. **Mark as in-flight** — the ID is added to `_hotInFlight` (`ConcurrentDictionary<Guid, byte>`)
+2. **Atomic PK-seek lock** — `TryLockByIdAsync` issues a single-row `UPDATE WHERE Id=@id AND Status=Pending AND LockedUntil < NOW` with an `OUTPUT INSERTED.*` clause. SQL Server evaluates this atomically under read-committed isolation — only one instance across the entire cluster can win
+3. **If won**: fetch subscriptions → deliver in parallel → save attempts → mark as processed/retry/dead-letter
+4. **If lost** (another instance already locked it): returns immediately with no work done
+5. **Remove from in-flight** — always in `finally`
+
+The channel capacity is 10,000 with `DropOldest`. Under a burst that exceeds capacity, the oldest hints are dropped — those messages are still in the database and will be picked up by the cold path within one polling interval. No message is ever lost; only the sub-millisecond delivery optimisation degrades gracefully.
+
+#### Cold path — cross-instance recovery, retries, overflow safety net
+
+The cold path runs on a fixed `ColdPollingInterval` (default 1 second) regardless of queue activity. It serves three purposes:
+
+| Scenario | How it's handled |
+|---|---|
+| Message published by **another instance** | Hot path channel is in-process only; the cold path's batch scan finds the row |
+| **Scheduled retry** (`NextRetryAt` in the future) | Cold path query includes `NextRetryAt <= NOW`; the message becomes eligible automatically |
+| **Channel overflow** (burst > 10,000 in-flight) | The dropped IDs are still in the DB; cold path catches them within 1 second |
+| **Lock expiry recovery** | `ReleaseExpiredLocksAsync` (throttled to once per 30 s) resets any message whose lock expired without being processed |
+
+Before the cold path queries the database, it snapshots the current `_hotInFlight` set and serialises it as JSON. The `LockNextBatchAsync` SQL includes:
+
+```sql
+AND m.[Id] NOT IN (SELECT CAST([value] AS uniqueidentifier) FROM OPENJSON(@skipJson))
+```
+
+This prevents the cold path from even attempting to lock a row that the hot path is currently processing, eliminating the intra-process race entirely. The `WITH (UPDLOCK, READPAST)` hint handles the cross-instance case: if the hot path on another instance holds an X lock on a row, `READPAST` skips it rather than blocking.
+
+#### How retries interact with both paths
+
+Retries **never** go through the hot path. When delivery fails:
+
+```
+Delivery fails
+    │
+    └─► IncrementRetryAsync(nextRetryAt = now + backoff)
+             Sets Status=Pending, NextRetryAt=<future>, clears lock
+
+                      ↓  (cold path, n seconds later)
+
+    LockNextBatchAsync: WHERE NextRetryAt <= SYSDATETIMEOFFSET()
+             Row becomes eligible once the backoff window expires
+```
+
+`Notify(messageId)` is called only at publish time. No signal is sent when a retry is scheduled. The cold path is the sole path for retries, and the `NextRetryAt` guard in the SQL is the scheduling mechanism.
+
+---
+
+### Multi-Instance Architecture
+
+In a real deployment you typically run multiple API replicas (for scale) and one or more Azure Functions (for serverless processing). All share the same SQL Server database. OutboxNet is designed for this topology from the ground up.
+
+```
+                              ┌────────────────────────────┐
+                              │        SQL Server DB        │
+                              │                             │
+                              │  OutboxMessages             │
+                              │  ┌────────────────────────┐ │
+                              │  │ Id  │Status│LockedBy   │ │
+                              │  │ ... │Pendng│           │ │
+                              │  │ ... │Procsg│api-inst-1 │ │
+                              │  │ ... │Pendng│           │ │
+                              │  │ ... │Procsg│api-inst-2 │ │
+                              │  └────────────────────────┘ │
+                              │  WebhookSubscriptions        │
+                              │  DeliveryAttempts            │
+                              └──────────┬─────────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────────┐
+              │                          │                              │
+              ▼                          ▼                              ▼
+  ┌────────────────────┐     ┌────────────────────┐       ┌───────────────────────┐
+  │  ASP.NET Core API   │     │  ASP.NET Core API   │       │   Azure Functions     │
+  │  Instance 1        │     │  Instance 2        │       │                       │
+  │                    │     │                    │       │  ┌─────────────────┐  │
+  │  ► Produces:       │     │  ► Produces:       │       │  │ Timer Trigger   │  │
+  │    IOutboxPublisher│     │    IOutboxPublisher│       │  │ (every 30 s)    │  │
+  │    (per request)   │     │    (per request)   │       │  │                 │  │
+  │                    │     │                    │       │  │ ProcessBatchAsync│  │
+  │  ► Consumes:       │     │  ► Consumes:       │       │  │ (cold path only)│  │
+  │    Hot path loop   │     │    Hot path loop   │       │  └─────────────────┘  │
+  │    Cold path loop  │     │    Cold path loop  │       │                       │
+  │                    │     │                    │       │  ► Also Produces:     │
+  │  InstanceId=       │     │  InstanceId=       │       │    IOutboxPublisher   │
+  │  "api-inst-1"      │     │  "api-inst-2"      │       │    (from queue msgs)  │
+  └────────┬───────────┘     └──────────┬─────────┘       └──────────┬────────────┘
+           │                            │                             │
+           │ Signals own channel only   │ Signals own channel only    │ No hot path
+           │ (in-process, per instance) │ (in-process, per instance)  │ (timer-based)
+           │                            │                             │
+           └────────────────────────────┴─────────────────────────────┘
+                                        │
+                              All query same DB.
+                    DB lock gate (UPDATE WHERE Status=Pending)
+                    ensures exactly one instance wins per message.
+                              │
+                              ▼
+                    ┌──────────────────────┐
+                    │   External Services   │
+                    │   (webhook receivers) │
+                    └──────────────────────┘
+```
+
+#### How each instance type behaves
+
+**ASP.NET Core API instances (run both paths)**
+
+Each instance runs `OutboxProcessorService` as a `BackgroundService`. When Instance 1 publishes a message, its `Channel<Guid>` receives the ID immediately — the hot path attempts `TryLockByIdAsync` in under 1 ms. Instance 2's cold path will see the same message in its next batch scan, but by then `Status=Processing` and `LockedUntil` is in the future, so `UPDLOCK+READPAST` skips it. No duplicate delivery.
+
+When Instance 2 publishes a message, the same logic applies in reverse. Its hot path wins the lock; Instance 1's cold path skips the row.
+
+**Azure Functions (cold path only)**
+
+The `OutboxTimerFunction` calls `ProcessBatchAsync` on each timer firing with no `skipIds` (there is no hot path in Functions). Multiple Function instances can fire simultaneously — the `WITH (UPDLOCK, READPAST)` CTE ensures each wins a disjoint subset of rows. Lock ownership is tracked by `LockedBy` (the `InstanceId`), so `MarkAsProcessedAsync` only succeeds for the instance that holds the lock.
+
+Azure Functions can also **produce** outbox messages (e.g., messages triggered by Service Bus or Queue events). `IOutboxPublisher` works identically — wraps the INSERT in the active transaction and calls `Notify()`. Since Functions have no hot-path loop, the `Notify()` is effectively a no-op (the channel is internal to `ChannelOutboxSignal` but nothing drains it). The next timer firing picks up the message via the cold path.
+
+#### Lock ownership and visibility timeout
+
+Every locked row carries `LockedBy = InstanceId` and `LockedUntil = NOW + DefaultVisibilityTimeout`. All terminal operations (`MarkAsProcessedAsync`, `IncrementRetryAsync`, `MarkAsDeadLetteredAsync`) include `WHERE LockedBy = @lockedBy`. If an instance crashes mid-delivery, the lock expires after `DefaultVisibilityTimeout` and `ReleaseExpiredLocksAsync` resets the row to `Status=Pending` for re-processing by any surviving instance.
+
+```
+  Instance crashes during delivery
+          │
+          └── LockedUntil expires (default: 5 min)
+                    │
+                    └── ReleaseExpiredLocksAsync (cold path, runs every 30 s)
+                              SET Status=Pending, LockedUntil=NULL, LockedBy=NULL
+                                        │
+                                        └── Any instance picks it up on next cold scan
+```
+
+Note: lock expiry intentionally does **not** increment `RetryCount`. An expired lock means infrastructure failure (crash, OOM, kill), not a delivery failure. Counting it against the retry budget would dead-letter healthy messages under transient pod restarts.
+
+#### What you get end-to-end
+
+| Scenario | Typical latency | Mechanism |
+|---|---|---|
+| Message published on the **same instance** that processes it | < 5 ms | Hot path Channel |
+| Message published on **instance A**, processed by **instance B** | ≤ `ColdPollingInterval` (1 s default) | Cold path batch scan |
+| Message published by **Azure Functions**, processed by Functions | ≤ timer interval (e.g. 30 s) | Timer trigger cold path |
+| **Retry** after delivery failure | `RetryPolicy.GetNextDelay(retryCount)` | Cold path once `NextRetryAt` passes |
+| **Lock expiry recovery** after crash | ≤ `DefaultVisibilityTimeout` + 30 s | `ReleaseExpiredLocksAsync` + cold path |
+
+---
+
+### Processing Pipeline (per message)
+
+Once a message is locked (by either path), the pipeline is identical:
+
+```
+  Locked OutboxMessage
+        │
+        ▼
+  1. Subscription pre-fetch
+     GetForMessageAsync(message)
+     One query per unique (EventType, TenantId) in the batch — cached for the
+     batch duration; N messages with the same routing key = 1 DB query.
+        │
+        ▼
+  2. Delivery state pre-fetch
+     GetDeliveryStatesAsync(messageId, subscriptionIds)
+     Single OPENJSON query returns (AttemptCount, HasSuccess) per subscription.
+     Already-succeeded subscriptions are skipped — safe to retry without
+     re-delivering to endpoints that already acknowledged.
+        │
+        ▼
+  3. Parallel delivery  (Parallel.ForEachAsync, DOP = MaxConcurrentSubscriptionDeliveries)
+     For each subscription not yet succeeded and not exhausted:
+       ├─ DeliveryId = SHA256(MessageId ‖ SubscriptionId ‖ AttemptNumber)
+       │    Deterministic — same (message, subscription, attempt) always yields
+       │    the same ID. Receivers use X-Outbox-Delivery-Id as idempotency key.
+       ├─ HTTP POST with HMAC-SHA256 signature + outbox headers
+       └─ Record DeliveryAttempt (success/fail, status code, duration, error)
+        │
+        ▼
+  4. Batch bookkeeping
+     SaveAttemptsAsync([all new DeliveryAttempt records])
+     Single INSERT for all subscriptions in one round-trip.
+
+     ⚠ If this fails after a successful delivery:
+        Do NOT retry immediately — that risks duplicate delivery.
+        Log CRITICAL, leave the lock in place.
+        Lock expires → message requeued → next attempt reads HasSuccess=true
+        from any partial records that did save → skips already-delivered subs.
+        Webhook consumers MUST be idempotent on X-Outbox-Message-Id.
+        │
+        ▼
+  5. Decision
+     ├─ All succeeded (or previously succeeded):  MarkAsProcessed
+     ├─ Any failed:                               IncrementRetry + backoff
+     │                                            (cold path picks up after NextRetryAt)
+     └─ All exhausted, none succeeded:            MarkAsDeadLettered
+```
 
 ## Configuration Reference
 
@@ -456,19 +680,13 @@ builder.Services.AddOutboxNet(options =>
 ```csharp
 .AddBackgroundProcessor(options =>
 {
-    // Minimum interval between polling cycles (also used as first backoff step).
-    // Default: 1 second
-    options.PollingInterval = TimeSpan.FromSeconds(1);
-
-    // Back off exponentially when queue is idle; process immediately when saturated.
-    // Default: true
-    options.AdaptivePolling = true;
-
-    // Maximum backoff cap when idle. Default: 60 seconds
-    options.MaxPollingInterval = TimeSpan.FromSeconds(60);
-
-    // Exponential multiplier per empty batch. Default: 1.5
-    options.IdleBackoffFactor = 1.5;
+    // How often the cold path scans the database for messages that were
+    // published by other instances, scheduled retries, or dropped hot-path hints.
+    // The hot path delivers same-instance messages immediately via Channel<Guid>
+    // with no polling delay at all.
+    // Default: 1 second. Lower values improve cross-instance latency at the cost
+    // of one additional lightweight indexed scan per interval per instance.
+    options.ColdPollingInterval = TimeSpan.FromSeconds(1);
 });
 ```
 

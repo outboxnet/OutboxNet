@@ -15,7 +15,7 @@ namespace OutboxNet.SampleApp.Data
 
         private readonly IOutboxPublisher outboxPublisher;
 
-        public SampleEntitiesController(SampleAppContext context, IOutboxPublisher outboxPublisher) 
+        public SampleEntitiesController(SampleAppContext context, IOutboxPublisher outboxPublisher)
         {
             _context = context;
             this.outboxPublisher = outboxPublisher;
@@ -60,19 +60,25 @@ namespace OutboxNet.SampleApp.Data
         {
             if (ModelState.IsValid)
             {
-                var transaction = await _context.Database.BeginTransactionAsync();
 
-                sampleEntity.Id = Guid.NewGuid();
-                _context.Add(sampleEntity);
-                await _context.SaveChangesAsync();
-
-                await outboxPublisher.PublishAsync("eventType", new
+                foreach (var item in Enumerable.Range(0, 100))
                 {
-                    id = sampleEntity.Id,
-                    prop = sampleEntity.Data1
-                });
 
-                await transaction.CommitAsync();
+                    var transaction = await _context.Database.BeginTransactionAsync();
+
+                    sampleEntity.Id = Guid.NewGuid();
+                    _context.Add(sampleEntity);
+                    await _context.SaveChangesAsync();
+
+                    await outboxPublisher.PublishAsync("eventType", new
+                    {
+                        id = sampleEntity.Id,
+                        prop = $"{sampleEntity.Data1}_{item}"
+                    });
+
+                    await transaction.CommitAsync();
+                }
+
 
                 return RedirectToAction(nameof(Index));
             }

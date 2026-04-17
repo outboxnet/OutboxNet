@@ -81,13 +81,14 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
         if (_secretRetriever is null || subscriptions.Count == 0)
             return subscriptions;
 
-        foreach (var sub in subscriptions)
+        // Fetch all secrets in parallel — important when the retriever calls Key Vault.
+        await Task.WhenAll(subscriptions.Select(async sub =>
         {
             var tenantKey = sub.TenantId ?? sub.Id.ToString();
             var secret = await _secretRetriever.GetSecretAsync(tenantKey, ct);
             if (secret is not null)
                 sub.Secret = secret;
-        }
+        }));
 
         return subscriptions;
     }

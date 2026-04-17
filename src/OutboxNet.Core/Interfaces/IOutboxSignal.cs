@@ -1,20 +1,18 @@
+using System.Threading.Channels;
+
 namespace OutboxNet.Interfaces;
 
 /// <summary>
-/// Lightweight signal used to wake the processor immediately after a message is published,
-/// eliminating the polling interval latency for the first message after an idle period.
+/// In-process channel that carries published message IDs to the processor.
+/// Publishers enqueue each message ID after their transaction commits.
+/// The processor hot-path drains the channel and locks each message individually
+/// via a PK-seek UPDATE — no polling, no batch scan, sub-millisecond latency.
 /// </summary>
 public interface IOutboxSignal
 {
-    /// <summary>
-    /// Signals that one or more outbox messages are ready to be processed.
-    /// Thread-safe; safe to call from publisher scopes concurrently.
-    /// </summary>
-    void Notify();
+    /// <summary>Enqueues a message ID for immediate hot-path processing.</summary>
+    void Notify(Guid messageId);
 
-    /// <summary>
-    /// Waits until a signal is received or <paramref name="timeout"/> elapses.
-    /// Returns <c>true</c> if a signal was received, <c>false</c> if it timed out.
-    /// </summary>
-    ValueTask<bool> WaitAsync(TimeSpan timeout, CancellationToken ct);
+    /// <summary>Async-enumerable reader consumed by the processor hot-path loop.</summary>
+    ChannelReader<Guid> Reader { get; }
 }

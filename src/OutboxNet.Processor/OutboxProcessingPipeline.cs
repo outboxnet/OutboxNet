@@ -20,7 +20,9 @@ public sealed class OutboxProcessingPipeline : IOutboxProcessor
     // ReleaseExpiredLocksAsync is an UPDATE across the entire table; throttle it so that
     // zero-delay hot-path polling (saturated queue) doesn't hammer it every cycle.
     private static readonly TimeSpan ReleaseExpiredLocksInterval = TimeSpan.FromSeconds(30);
-    private DateTimeOffset _lastLockRelease = DateTimeOffset.MinValue;
+    // Stored as UTC ticks so Interlocked.Read/Exchange can be used for thread safety.
+    // Azure Functions may invoke ProcessBatchAsync concurrently from multiple timer firings.
+    private long _lastLockReleaseTicks = DateTimeOffset.MinValue.UtcTicks;
 
     public OutboxProcessingPipeline(
         IServiceScopeFactory scopeFactory,
@@ -34,7 +36,7 @@ public sealed class OutboxProcessingPipeline : IOutboxProcessor
         _logger = logger;
     }
 
-    public async Task<int> ProcessBatchAsync(CancellationToken ct = default)
+    public async Task<int> ProcessBatchAsync(CancellationToken ct = default, IReadOnlySet<Guid>? skipIds = null)
     {
         using var activity = OutboxActivitySource.Source.StartActivity("outbox.process_batch");
         var batchStopwatch = Stopwatch.StartNew();
@@ -48,17 +50,20 @@ public sealed class OutboxProcessingPipeline : IOutboxProcessor
             var messagePublisher = sp.GetService<IMessagePublisher>();
 
             // Throttled: only run ReleaseExpiredLocksAsync once every 30 s.
-            var now = DateTimeOffset.UtcNow;
-            if (now - _lastLockRelease >= ReleaseExpiredLocksInterval)
+            // Use Interlocked so concurrent Azure Functions invocations don't both fire it.
+            var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+            var lastTicks = Interlocked.Read(ref _lastLockReleaseTicks);
+            if (nowTicks - lastTicks >= ReleaseExpiredLocksInterval.Ticks
+                && Interlocked.CompareExchange(ref _lastLockReleaseTicks, nowTicks, lastTicks) == lastTicks)
             {
                 await outboxStore.ReleaseExpiredLocksAsync(ct);
-                _lastLockRelease = now;
             }
 
             var messages = await outboxStore.LockNextBatchAsync(
                 _options.BatchSize,
                 _options.DefaultVisibilityTimeout,
                 lockedBy,
+                skipIds,
                 ct);
 
             if (messages.Count == 0)
@@ -96,6 +101,43 @@ public sealed class OutboxProcessingPipeline : IOutboxProcessor
             batchStopwatch.Stop();
             OutboxMetrics.ProcessingDuration.Record(batchStopwatch.Elapsed.TotalMilliseconds);
         }
+    }
+
+    public async Task<bool> TryProcessByIdAsync(Guid messageId, CancellationToken ct = default)
+    {
+        var lockedBy = _options.InstanceId;
+
+        using var scope = _scopeFactory.CreateScope();
+        var sp = scope.ServiceProvider;
+        var outboxStore = sp.GetRequiredService<IOutboxStore>();
+
+        var message = await outboxStore.TryLockByIdAsync(
+            messageId, _options.DefaultVisibilityTimeout, lockedBy, ct);
+
+        if (message is null)
+            return false;
+
+        IReadOnlyList<WebhookSubscription> subscriptions;
+        if (_options.ProcessingMode == ProcessingMode.QueueMediated)
+        {
+            var messagePublisher = sp.GetService<IMessagePublisher>();
+            if (messagePublisher is not null)
+                await ProcessQueueMediatedAsync([message], lockedBy, outboxStore, messagePublisher, ct);
+            return true;
+        }
+
+        subscriptions = await sp.GetRequiredService<ISubscriptionReader>().GetForMessageAsync(message, ct);
+
+        await ProcessSingleMessageAsync(
+            message,
+            lockedBy,
+            subscriptions,
+            outboxStore,
+            sp.GetRequiredService<IDeliveryAttemptStore>(),
+            sp.GetRequiredService<IWebhookDeliverer>(),
+            ct);
+
+        return true;
     }
 
     // ── Subscription cache ────────────────────────────────────────────────────

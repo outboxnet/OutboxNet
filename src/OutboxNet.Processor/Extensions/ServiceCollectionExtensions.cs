@@ -16,10 +16,7 @@ public static class ServiceCollectionExtensions
 
         builder.Services.Configure<ProcessorOptions>(o =>
         {
-            o.PollingInterval = options.PollingInterval;
-            o.AdaptivePolling = options.AdaptivePolling;
-            o.MaxPollingInterval = options.MaxPollingInterval;
-            o.IdleBackoffFactor = options.IdleBackoffFactor;
+            o.ColdPollingInterval = options.ColdPollingInterval;
         });
 
         // Singleton: the pipeline only takes singletons (IServiceScopeFactory, IRetryPolicy,

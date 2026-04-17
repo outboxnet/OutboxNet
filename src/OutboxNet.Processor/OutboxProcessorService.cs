@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -16,6 +17,13 @@ public sealed class OutboxProcessorService : BackgroundService
     private readonly OutboxOptions _outboxOptions;
     private readonly ILogger<OutboxProcessorService> _logger;
 
+    // IDs currently being processed by the hot path. The cold path skips these so that
+    // fresh same-instance messages are handled exclusively by the hot path and the cold path
+    // focuses on cross-instance messages, retries, and channel-overflow recovery.
+    // This is a same-process optimisation only — the DB lock gate remains the correctness
+    // guarantee for multi-instance scenarios.
+    private readonly ConcurrentDictionary<Guid, byte> _hotInFlight = new();
+
     public OutboxProcessorService(
         IOutboxProcessor processor,
         IOutboxSignal signal,
@@ -33,10 +41,9 @@ public sealed class OutboxProcessorService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "Outbox processor started. Min interval: {Interval}ms, adaptive: {Adaptive}",
-            _processorOptions.PollingInterval.TotalMilliseconds, _processorOptions.AdaptivePolling);
+            "Outbox processor started. Cold polling interval: {Interval}ms",
+            _processorOptions.ColdPollingInterval.TotalMilliseconds);
 
-        // Warn if the batch/concurrency product will open many simultaneous DB scopes.
         var fanout = _outboxOptions.BatchSize * _outboxOptions.MaxConcurrentDeliveries
                      * _outboxOptions.MaxConcurrentSubscriptionDeliveries;
         if (fanout >= FanoutWarningThreshold)
@@ -49,75 +56,82 @@ public sealed class OutboxProcessorService : BackgroundService
                 _outboxOptions.MaxConcurrentSubscriptionDeliveries, fanout);
         }
 
-        // currentInterval = TimeSpan.Zero → process the first batch immediately on startup
-        // without waiting for a signal or delay.
-        var currentInterval = TimeSpan.Zero;
+        await Task.WhenAll(
+            RunHotPathAsync(stoppingToken),
+            RunColdPathAsync(stoppingToken));
+    }
 
-        while (!stoppingToken.IsCancellationRequested)
+    // Hot path: drain the in-process channel as message IDs arrive.
+    // Parallel.ForEachAsync keeps up to MaxConcurrentDeliveries in-flight simultaneously.
+    // Each TryProcessByIdAsync does a PK-seek UPDATE — only one instance wins per message ID.
+    private async Task RunHotPathAsync(CancellationToken ct)
+    {
+        try
         {
-            // Wait for either:
-            //   (a) a push signal from IOutboxPublisher  → near-zero latency
-            //   (b) the polling timeout to elapse        → fallback safety net
-            //   (c) zero interval (saturated / startup)  → process immediately
-            if (currentInterval > TimeSpan.Zero)
-            {
-                try
+            await Parallel.ForEachAsync(
+                _signal.Reader.ReadAllAsync(ct),
+                new ParallelOptions
                 {
-                    // WaitAsync returns as soon as IOutboxSignal.Notify() is called or timeout fires.
-                    await _signal.WaitAsync(currentInterval, stoppingToken);
-                }
-                catch (OperationCanceledException)
+                    MaxDegreeOfParallelism = _outboxOptions.MaxConcurrentDeliveries,
+                    CancellationToken = ct
+                },
+                async (messageId, token) =>
                 {
-                    break;
-                }
-            }
-
-            int processed;
-            try
-            {
-                processed = await _processor.ProcessBatchAsync(stoppingToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogError(ex, "Outbox processing batch failed");
-
-                // On error: back off from at least the base interval, not from zero.
-                var basis = currentInterval == TimeSpan.Zero ? _processorOptions.PollingInterval : currentInterval;
-                currentInterval = _processorOptions.AdaptivePolling ? BackOff(basis) : _processorOptions.PollingInterval;
-                continue;
-            }
-
-            if (!_processorOptions.AdaptivePolling)
-            {
-                currentInterval = _processorOptions.PollingInterval;
-                continue;
-            }
-
-            if (processed >= _outboxOptions.BatchSize)
-            {
-                // Queue is saturated — loop again immediately with no delay.
-                currentInterval = TimeSpan.Zero;
-            }
-            else if (processed > 0)
-            {
-                // Partial batch — stay at minimum interval to drain quickly.
-                currentInterval = _processorOptions.PollingInterval;
-            }
-            else
-            {
-                // Idle batch — back off exponentially; we'll be woken by the signal if a
-                // new message arrives before the timeout elapses.
-                var basis = currentInterval == TimeSpan.Zero ? _processorOptions.PollingInterval : currentInterval;
-                currentInterval = BackOff(basis);
-            }
+                    _hotInFlight.TryAdd(messageId, 0);
+                    try
+                    {
+                        await _processor.TryProcessByIdAsync(messageId, token);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger.LogError(ex, "Hot-path processing failed for message {MessageId}", messageId);
+                    }
+                    finally
+                    {
+                        _hotInFlight.TryRemove(messageId, out _);
+                    }
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown
         }
     }
 
-    private TimeSpan BackOff(TimeSpan current)
+    // Cold path: fixed-interval scan for cross-instance messages, scheduled retries,
+    // and recovery from channel overflow (DropOldest). Skips IDs currently in-flight
+    // on the hot path to avoid racing for the same message within this instance.
+    private async Task RunColdPathAsync(CancellationToken ct)
     {
-        var next = TimeSpan.FromMilliseconds(current.TotalMilliseconds * _processorOptions.IdleBackoffFactor);
-        if (next > _processorOptions.MaxPollingInterval) next = _processorOptions.MaxPollingInterval;
-        _logger.LogDebug("Outbox polling backing off to {Interval}ms", next.TotalMilliseconds);
-        return next;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                // Snapshot the in-flight set at call time. ConcurrentDictionary.Keys is a
+                // point-in-time view; wrapping it in HashSet<Guid> gives IReadOnlySet<Guid>
+                // and an O(1) lookup if the pipeline ever needs Contains().
+                var skipIds = _hotInFlight.IsEmpty
+                    ? null
+                    : new HashSet<Guid>(_hotInFlight.Keys);
+                await _processor.ProcessBatchAsync(ct, skipIds);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Cold-path outbox processing batch failed");
+            }
+
+            try
+            {
+                await Task.Delay(_processorOptions.ColdPollingInterval, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
     }
 }

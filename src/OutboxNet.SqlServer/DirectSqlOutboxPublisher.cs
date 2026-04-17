@@ -87,6 +87,6 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
 
         // Wake the processor immediately after the INSERT commits with the caller's transaction.
         // Fire-and-forget: does not affect transactional guarantee.
-        _signal.Notify();
+        _signal.Notify(messageId);
     }
 }
