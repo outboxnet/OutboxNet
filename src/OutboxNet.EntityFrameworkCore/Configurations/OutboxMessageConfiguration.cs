@@ -58,8 +58,7 @@ public class OutboxMessageConfiguration : IEntityTypeConfiguration<OutboxMessage
         // Ordered-processing NOT EXISTS sub-query scan: filters by Status=Processing
         // AND LockedUntil > now, partitioned by (TenantId, UserId, EntityId).
         builder.HasIndex(m => new { m.TenantId, m.UserId, m.EntityId, m.Status, m.LockedUntil })
-            .HasDatabaseName("IX_OutboxMessages_PartitionKey_Status")
-            .HasFilter("[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
+            .HasDatabaseName("IX_OutboxMessages_PartitionKey_Status");
 
         // General EventType lookup (admin queries, subscription routing checks).
         builder.HasIndex(m => m.EventType)

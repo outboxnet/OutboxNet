@@ -27,10 +27,11 @@ public class DeliveryAttemptConfiguration : IEntityTypeConfiguration<DeliveryAtt
             .HasForeignKey(d => d.OutboxMessageId)
             .OnDelete(DeleteBehavior.Cascade);
 
-        builder.HasOne(d => d.WebhookSubscription)
-            .WithMany()
-            .HasForeignKey(d => d.WebhookSubscriptionId)
-            .OnDelete(DeleteBehavior.Cascade);
+        // WebhookSubscriptionId is a plain correlation column — no FK constraint.
+        // Config-driven subscriptions (ConfigSubscriptionStore) are never persisted in
+        // WebhookSubscriptions, so a DB-level FK would cause SaveAttemptsAsync to fail
+        // for every config-based delivery, preventing MarkAsProcessed from ever running.
+        builder.Property(d => d.WebhookSubscriptionId).IsRequired();
 
         // ── Indexes ───────────────────────────────────────────────────────────
 

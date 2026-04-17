@@ -38,11 +38,11 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
                 """);
 
             // Ordered-processing NOT EXISTS sub-query scan (replaces old PartitionKey index).
-            migrationBuilder.Sql("""
-                CREATE INDEX [IX_OutboxMessages_PartitionKey_Status]
-                    ON [outbox].[OutboxMessages] ([TenantId], [UserId], [EntityId], [Status], [LockedUntil])
-                    WHERE [TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL
-                """);
+            migrationBuilder.CreateIndex(
+                name: "IX_OutboxMessages_PartitionKey_Status",
+                schema: "outbox",
+                table: "OutboxMessages",
+                columns: new[] { "TenantId", "UserId", "EntityId", "Status", "LockedUntil" });
 
             // ── DeliveryAttempts ───────────────────────────────────────────────
 
@@ -125,8 +125,7 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
                 name: "IX_OutboxMessages_PartitionKey",
                 schema: "outbox",
                 table: "OutboxMessages",
-                columns: new[] { "TenantId", "UserId", "EntityId" },
-                filter: "[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
+                columns: new[] { "TenantId", "UserId", "EntityId" });
 
             migrationBuilder.CreateIndex(
                 name: "IX_DeliveryAttempts_MessageId",

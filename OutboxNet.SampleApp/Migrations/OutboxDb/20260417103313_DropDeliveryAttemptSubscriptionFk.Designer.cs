@@ -3,6 +3,7 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using OutboxNet.EntityFrameworkCore;
 
@@ -11,9 +12,11 @@ using OutboxNet.EntityFrameworkCore;
 namespace OutboxNet.SampleApp.Migrations.OutboxDb
 {
     [DbContext(typeof(OutboxDbContext))]
-    partial class OutboxDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260417103313_DropDeliveryAttemptSubscriptionFk")]
+    partial class DropDeliveryAttemptSubscriptionFk
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

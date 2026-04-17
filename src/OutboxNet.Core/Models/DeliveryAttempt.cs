@@ -14,6 +14,7 @@ public class DeliveryAttempt
     public DateTimeOffset AttemptedAt { get; set; }
     public DateTimeOffset? NextRetryAt { get; set; }
 
+    // Navigation to OutboxMessage only — no FK to WebhookSubscriptions because
+    // config-driven subscriptions are never stored in that table.
     public OutboxMessage OutboxMessage { get; set; } = default!;
-    public WebhookSubscription WebhookSubscription { get; set; } = default!;
 }

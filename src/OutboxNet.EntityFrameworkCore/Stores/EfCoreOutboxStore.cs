@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -102,15 +103,23 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             INNER JOIN Candidates c ON c.[Id] = m.[Id]
             """;
 
+        // Build parameter list conditionally: @tenantFilter must NOT be declared when
+        // tenantFilterClause is empty — sp_executesql rejects unused declared parameters,
+        // which corrupts binding for all subsequent parameters (@pendingStatus, etc.).
+        var sqlParams = new List<SqlParameter>
+        {
+            new SqlParameter("@batchSize",       SqlDbType.Int) { Value = batchSize },
+            new SqlParameter("@processingStatus", SqlDbType.Int) { Value = (int)MessageStatus.Processing },
+            new SqlParameter("@pendingStatus",    SqlDbType.Int) { Value = (int)MessageStatus.Pending },
+            new SqlParameter("@lockedUntil",      SqlDbType.DateTimeOffset) { Value = lockedUntil },
+            new SqlParameter("@lockedBy",         SqlDbType.NVarChar, 256) { Value = lockedBy },
+        };
+
+        if (_options.TenantFilter is not null)
+            sqlParams.Add(new SqlParameter("@tenantFilter", SqlDbType.NVarChar, 256) { Value = _options.TenantFilter });
+
         var messages = await _dbContext.OutboxMessages
-            .FromSqlRaw(
-                sql,
-                new SqlParameter("@batchSize", batchSize),
-                new SqlParameter("@processingStatus", (int)MessageStatus.Processing),
-                new SqlParameter("@pendingStatus", (int)MessageStatus.Pending),
-                new SqlParameter("@lockedUntil", lockedUntil),
-                new SqlParameter("@lockedBy", lockedBy),
-                new SqlParameter("@tenantFilter", (object?)_options.TenantFilter ?? DBNull.Value))
+            .FromSqlRaw(sql, sqlParams.ToArray<object>())
             .AsNoTracking()
             .ToListAsync(ct);
 

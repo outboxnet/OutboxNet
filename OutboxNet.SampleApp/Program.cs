@@ -35,7 +35,9 @@ namespace OutboxNet.SampleApp
                  opt.MigrationsAssembly = "OutboxNet.SampleApp";
              })
             .AddBackgroundProcessor()
-            .AddWebhookDelivery();
+            .AddWebhookDelivery()
+            .UseConfigWebhooks(builder.Configuration);
+            ;
 
             var app = builder.Build();
 

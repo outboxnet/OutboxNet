@@ -140,7 +140,10 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
         command.Parameters.Add(new SqlParameter("@PendingStatus", SqlDbType.Int) { Value = (int)MessageStatus.Pending });
         command.Parameters.Add(new SqlParameter("@VisibilityTimeoutSeconds", SqlDbType.Int) { Value = (int)visibilityTimeout.TotalSeconds });
         command.Parameters.Add(new SqlParameter("@LockedBy", SqlDbType.NVarChar, 256) { Value = lockedBy });
-        command.Parameters.Add(new SqlParameter("@TenantFilter", SqlDbType.NVarChar, 256) { Value = (object?)_options.TenantFilter ?? DBNull.Value });
+        // Only declare @TenantFilter when the clause is actually in the SQL.
+        // sp_executesql rejects declared parameters that are not referenced in the query body.
+        if (_options.TenantFilter is not null)
+            command.Parameters.Add(new SqlParameter("@TenantFilter", SqlDbType.NVarChar, 256) { Value = _options.TenantFilter });
 
         var messages = new List<OutboxMessage>();
 

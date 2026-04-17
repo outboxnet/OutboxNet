@@ -38,8 +38,7 @@ namespace OutboxNet.SampleApp.Migrations.OutboxDb
                 name: "IX_OutboxMessages_PartitionKey",
                 schema: "outbox",
                 table: "OutboxMessages",
-                columns: new[] { "TenantId", "UserId", "EntityId" },
-                filter: "[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
+                columns: new[] { "TenantId", "UserId", "EntityId" });
         }
 
         /// <inheritdoc />
