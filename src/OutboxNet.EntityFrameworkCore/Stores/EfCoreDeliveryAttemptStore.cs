@@ -19,6 +19,16 @@ internal sealed class EfCoreDeliveryAttemptStore : IDeliveryAttemptStore
         await _dbContext.SaveChangesAsync(ct);
     }
 
+    /// <summary>
+    /// Persists all attempts in a single <c>SaveChangesAsync</c> call (one round-trip).
+    /// </summary>
+    public async Task SaveAttemptsAsync(IReadOnlyList<DeliveryAttempt> attempts, CancellationToken ct = default)
+    {
+        if (attempts.Count == 0) return;
+        _dbContext.DeliveryAttempts.AddRange(attempts);
+        await _dbContext.SaveChangesAsync(ct);
+    }
+
     public async Task<IReadOnlyList<DeliveryAttempt>> GetByMessageIdAsync(Guid messageId, CancellationToken ct = default)
     {
         return await _dbContext.DeliveryAttempts
@@ -39,19 +49,28 @@ internal sealed class EfCoreDeliveryAttemptStore : IDeliveryAttemptStore
             .ToListAsync(ct);
     }
 
-    public async Task<int> GetAttemptCountAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
+    public async Task<IReadOnlyDictionary<Guid, SubscriptionDeliveryState>> GetDeliveryStatesAsync(
+        Guid messageId,
+        IReadOnlyList<Guid> subscriptionIds,
+        CancellationToken ct = default)
     {
-        return await _dbContext.DeliveryAttempts
-            .CountAsync(d => d.OutboxMessageId == messageId
-                          && d.WebhookSubscriptionId == subscriptionId, ct);
-    }
+        if (subscriptionIds.Count == 0)
+            return new Dictionary<Guid, SubscriptionDeliveryState>();
 
-    public async Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
-    {
-        return await _dbContext.DeliveryAttempts
-            .AnyAsync(d => d.OutboxMessageId == messageId
-                        && d.WebhookSubscriptionId == subscriptionId
-                        && d.Status == DeliveryStatus.Success, ct);
+        var rows = await _dbContext.DeliveryAttempts
+            .Where(d => d.OutboxMessageId == messageId && subscriptionIds.Contains(d.WebhookSubscriptionId))
+            .GroupBy(d => d.WebhookSubscriptionId)
+            .Select(g => new
+            {
+                SubscriptionId = g.Key,
+                AttemptCount = g.Count(),
+                HasSuccess = g.Any(d => d.Status == DeliveryStatus.Success)
+            })
+            .ToListAsync(ct);
+
+        return rows.ToDictionary(
+            r => r.SubscriptionId,
+            r => new SubscriptionDeliveryState(r.AttemptCount, r.HasSuccess));
     }
 
     public async Task<int> PurgeOldAttemptsAsync(DateTimeOffset olderThan, CancellationToken ct = default)

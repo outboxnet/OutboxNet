@@ -21,7 +21,6 @@ public class OutboxProcessingPipelineTests
 
     private OutboxProcessingPipeline CreatePipeline(OutboxOptions? options = null)
     {
-        // Build a scope factory that returns our mocks from both batch and message scopes.
         var scopeFactory = Substitute.For<IServiceScopeFactory>();
         var scope = Substitute.For<IServiceScope>();
         var sp = Substitute.For<IServiceProvider>();
@@ -43,12 +42,6 @@ public class OutboxProcessingPipelineTests
             NullLogger<OutboxProcessingPipeline>.Instance);
     }
 
-    private void SetupLockHeld()
-    {
-        _outboxStore.IsLockHeldAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(true);
-    }
-
     private void SetupMarkAsProcessed()
     {
         _outboxStore.MarkAsProcessedAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
@@ -67,14 +60,25 @@ public class OutboxProcessingPipelineTests
             .Returns(true);
     }
 
-    private void SetupNoSuccessfulDelivery()
+    private void SetupNoDeliveryStates()
     {
-        _deliveryAttemptStore.HasSuccessfulDeliveryAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<CancellationToken>())
-            .Returns(false);
+        _deliveryAttemptStore
+            .GetDeliveryStatesAsync(Arg.Any<Guid>(), Arg.Any<IReadOnlyList<Guid>>(), Arg.Any<CancellationToken>())
+            .Returns(new Dictionary<Guid, SubscriptionDeliveryState>());
+    }
+
+    private void SetupDeliveryState(Guid subscriptionId, int attemptCount, bool hasSuccess)
+    {
+        _deliveryAttemptStore
+            .GetDeliveryStatesAsync(Arg.Any<Guid>(), Arg.Any<IReadOnlyList<Guid>>(), Arg.Any<CancellationToken>())
+            .Returns(new Dictionary<Guid, SubscriptionDeliveryState>
+            {
+                [subscriptionId] = new SubscriptionDeliveryState(attemptCount, hasSuccess)
+            });
     }
 
     [Fact]
-    public async Task ProcessBatchAsync_ReleasesExpiredLocks_BeforeLocking()
+    public async Task ProcessBatchAsync_ReleasesExpiredLocks_OnFirstPoll()
     {
         _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new List<OutboxMessage>());
@@ -82,6 +86,7 @@ public class OutboxProcessingPipelineTests
         var pipeline = CreatePipeline();
         await pipeline.ProcessBatchAsync();
 
+        // First call always triggers ReleaseExpiredLocksAsync (last-release starts at MinValue).
         await _outboxStore.Received(1).ReleaseExpiredLocksAsync(Arg.Any<CancellationToken>());
     }
 
@@ -101,7 +106,6 @@ public class OutboxProcessingPipelineTests
     [Fact]
     public async Task ProcessBatchAsync_WithMessage_NoSubscriptions_MarksAsProcessed()
     {
-        SetupLockHeld();
         SetupMarkAsProcessed();
 
         var message = new OutboxMessage
@@ -126,36 +130,10 @@ public class OutboxProcessingPipelineTests
     }
 
     [Fact]
-    public async Task ProcessBatchAsync_LockLost_SkipsDelivery()
-    {
-        _outboxStore.IsLockHeldAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(false);
-
-        var message = new OutboxMessage
-        {
-            Id = Guid.NewGuid(),
-            EventType = "order.placed",
-            Payload = "{}",
-            Status = MessageStatus.Processing,
-            CreatedAt = DateTimeOffset.UtcNow
-        };
-
-        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(new List<OutboxMessage> { message });
-
-        var pipeline = CreatePipeline();
-        await pipeline.ProcessBatchAsync();
-
-        await _webhookDeliverer.DidNotReceive().DeliverAsync(Arg.Any<OutboxMessage>(), Arg.Any<WebhookSubscription>(), Arg.Any<CancellationToken>());
-        await _outboxStore.DidNotReceive().MarkAsProcessedAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
-    }
-
-    [Fact]
     public async Task ProcessBatchAsync_SuccessfulDelivery_MarksAsProcessed()
     {
-        SetupLockHeld();
         SetupMarkAsProcessed();
-        SetupNoSuccessfulDelivery();
+        SetupNoDeliveryStates();
 
         var message = new OutboxMessage
         {
@@ -181,27 +159,26 @@ public class OutboxProcessingPipelineTests
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
-        _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
-            .Returns(0);
-
-        _webhookDeliverer.DeliverAsync(message, subscription, Arg.Any<CancellationToken>())
+        _webhookDeliverer.DeliverAsync(message, subscription, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
             .Returns(new DeliveryResult(true, 200, "OK", null, 50));
 
         var pipeline = CreatePipeline();
         await pipeline.ProcessBatchAsync();
 
         await _outboxStore.Received(1).MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
-        await _deliveryAttemptStore.Received(1).SaveAttemptAsync(
-            Arg.Is<DeliveryAttempt>(a => a.Status == DeliveryStatus.Success && a.AttemptNumber == 1),
+        await _deliveryAttemptStore.Received(1).SaveAttemptsAsync(
+            Arg.Is<IReadOnlyList<DeliveryAttempt>>(list =>
+                list.Count == 1 &&
+                list[0].Status == DeliveryStatus.Success &&
+                list[0].AttemptNumber == 1),
             Arg.Any<CancellationToken>());
     }
 
     [Fact]
     public async Task ProcessBatchAsync_FailedDelivery_WithRetriesRemaining_IncrementsRetry()
     {
-        SetupLockHeld();
         SetupIncrementRetry();
-        SetupNoSuccessfulDelivery();
+        SetupNoDeliveryStates();
 
         var message = new OutboxMessage
         {
@@ -229,10 +206,7 @@ public class OutboxProcessingPipelineTests
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
-        _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
-            .Returns(0);
-
-        _webhookDeliverer.DeliverAsync(message, subscription, Arg.Any<CancellationToken>())
+        _webhookDeliverer.DeliverAsync(message, subscription, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
             .Returns(new DeliveryResult(false, 500, "Error", "HTTP 500", 100));
 
         _retryPolicy.GetNextDelay(0).Returns(TimeSpan.FromSeconds(10));
@@ -251,9 +225,7 @@ public class OutboxProcessingPipelineTests
     [Fact]
     public async Task ProcessBatchAsync_FailedDelivery_RetriesExhausted_DeadLetters()
     {
-        SetupLockHeld();
         SetupMarkAsDeadLettered();
-        SetupNoSuccessfulDelivery();
 
         var message = new OutboxMessage
         {
@@ -281,25 +253,22 @@ public class OutboxProcessingPipelineTests
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
-        // Attempt count > MaxRetries means this subscription is exhausted.
-        _deliveryAttemptStore.GetAttemptCountAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
-            .Returns(6); // > MaxRetries(5) → skipped
-
-        _retryPolicy.GetNextDelay(5).Returns((TimeSpan?)null);
+        // Attempt count > MaxRetries and no prior success → exhausted without success → dead-letter.
+        SetupDeliveryState(subscription.Id, 6, hasSuccess: false); // 6 > MaxRetries(5)
 
         var pipeline = CreatePipeline();
         await pipeline.ProcessBatchAsync();
 
-        // All subscriptions skipped (exhausted) → allDone=true, anyPending=false → mark processed
-        await _outboxStore.Received(1).MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        // All subscriptions exhausted without success → MarkAsDeadLettered
+        await _outboxStore.Received(1).MarkAsDeadLetteredAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _outboxStore.DidNotReceive().MarkAsProcessedAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
     public async Task ProcessBatchAsync_MultipleSubscriptions_AllMustSucceed()
     {
-        SetupLockHeld();
         SetupIncrementRetry();
-        SetupNoSuccessfulDelivery();
+        SetupNoDeliveryStates();
 
         var message = new OutboxMessage
         {
@@ -319,12 +288,10 @@ public class OutboxProcessingPipelineTests
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { sub1, sub2 });
 
-        _deliveryAttemptStore.GetAttemptCountAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<CancellationToken>()).Returns(0);
-
         // sub1 succeeds, sub2 fails
-        _webhookDeliverer.DeliverAsync(message, sub1, Arg.Any<CancellationToken>())
+        _webhookDeliverer.DeliverAsync(message, sub1, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
             .Returns(new DeliveryResult(true, 200, "OK", null, 50));
-        _webhookDeliverer.DeliverAsync(message, sub2, Arg.Any<CancellationToken>())
+        _webhookDeliverer.DeliverAsync(message, sub2, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
             .Returns(new DeliveryResult(false, 503, "Unavailable", "HTTP 503", 100));
 
         _retryPolicy.GetNextDelay(0).Returns(TimeSpan.FromSeconds(5));
@@ -341,7 +308,6 @@ public class OutboxProcessingPipelineTests
     [Fact]
     public async Task ProcessBatchAsync_AlreadySucceededSubscription_IsSkipped()
     {
-        SetupLockHeld();
         SetupMarkAsProcessed();
 
         var message = new OutboxMessage
@@ -368,16 +334,54 @@ public class OutboxProcessingPipelineTests
         _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
             .Returns(new List<WebhookSubscription> { subscription });
 
-        // This subscription already succeeded previously (#7 fix).
-        _deliveryAttemptStore.HasSuccessfulDeliveryAsync(message.Id, subscription.Id, Arg.Any<CancellationToken>())
-            .Returns(true);
+        // This subscription already succeeded previously — pipeline reads this via GetDeliveryStatesAsync.
+        SetupDeliveryState(subscription.Id, 1, hasSuccess: true);
 
         var pipeline = CreatePipeline();
         await pipeline.ProcessBatchAsync();
 
         // Delivery should be skipped
-        await _webhookDeliverer.DidNotReceive().DeliverAsync(Arg.Any<OutboxMessage>(), Arg.Any<WebhookSubscription>(), Arg.Any<CancellationToken>());
+        await _webhookDeliverer.DidNotReceive().DeliverAsync(Arg.Any<OutboxMessage>(), Arg.Any<WebhookSubscription>(), Arg.Any<Guid?>(), Arg.Any<CancellationToken>());
         // All done (skipped), so mark processed
         await _outboxStore.Received(1).MarkAsProcessedAsync(message.Id, Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProcessBatchAsync_BatchSaveAttempts_UsedInsteadOfIndividualSave()
+    {
+        SetupMarkAsProcessed();
+        SetupNoDeliveryStates();
+
+        var message = new OutboxMessage
+        {
+            Id = Guid.NewGuid(),
+            EventType = "order.placed",
+            Payload = "{}",
+            Status = MessageStatus.Processing,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+
+        var sub1 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://a.com", Secret = "s1", IsActive = true };
+        var sub2 = new WebhookSubscription { Id = Guid.NewGuid(), EventType = "order.placed", WebhookUrl = "https://b.com", Secret = "s2", IsActive = true };
+
+        _outboxStore.LockNextBatchAsync(Arg.Any<int>(), Arg.Any<TimeSpan>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(new List<OutboxMessage> { message });
+
+        _subscriptionReader.GetForMessageAsync(message, Arg.Any<CancellationToken>())
+            .Returns(new List<WebhookSubscription> { sub1, sub2 });
+
+        _webhookDeliverer.DeliverAsync(message, sub1, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
+            .Returns(new DeliveryResult(true, 200, "OK", null, 10));
+        _webhookDeliverer.DeliverAsync(message, sub2, Arg.Any<Guid?>(), Arg.Any<CancellationToken>())
+            .Returns(new DeliveryResult(true, 200, "OK", null, 10));
+
+        var pipeline = CreatePipeline();
+        await pipeline.ProcessBatchAsync();
+
+        // Both attempts saved in a single SaveAttemptsAsync call, not two SaveAttemptAsync calls.
+        await _deliveryAttemptStore.Received(1).SaveAttemptsAsync(
+            Arg.Is<IReadOnlyList<DeliveryAttempt>>(list => list.Count == 2),
+            Arg.Any<CancellationToken>());
+        await _deliveryAttemptStore.DidNotReceive().SaveAttemptAsync(Arg.Any<DeliveryAttempt>(), Arg.Any<CancellationToken>());
     }
 }

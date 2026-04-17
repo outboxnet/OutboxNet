@@ -66,7 +66,7 @@ public class ServiceCollectionExtensionsTests
 
         options.Value.BatchSize.Should().Be(50);
         options.Value.SchemaName.Should().Be("outbox");
-        options.Value.DefaultVisibilityTimeout.Should().Be(TimeSpan.FromSeconds(60));
+        options.Value.DefaultVisibilityTimeout.Should().Be(TimeSpan.FromMinutes(5));
         options.Value.MaxConcurrentDeliveries.Should().Be(10);
         options.Value.ProcessingMode.Should().Be(ProcessingMode.DirectDelivery);
     }

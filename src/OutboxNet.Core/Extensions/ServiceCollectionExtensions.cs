@@ -5,6 +5,7 @@ using OutboxNet.Interfaces;
 using OutboxNet.Options;
 using OutboxNet.Secrets;
 using OutboxNet.Serialization;
+using OutboxNet.Signals;
 using OutboxNet.Subscriptions;
 
 namespace OutboxNet.Extensions;
@@ -33,6 +34,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IMessageSerializer, JsonMessageSerializer>();
         // Default accessor returns null for both fields; override with UseHttpContextAccessor().
         services.AddScoped<IOutboxContextAccessor, NullOutboxContextAccessor>();
+        // Default no-op reader; replaced when UseSqlServerContext / UseDirectSqlServer /
+        // UseConfigWebhooks is called. Prevents startup crash if no store is registered.
+        services.AddSingleton<ISubscriptionReader, NullSubscriptionReader>();
+        // Push signal: singleton channel that lets publishers wake the processor immediately,
+        // eliminating polling-interval latency for the first message after an idle period.
+        services.AddSingleton<IOutboxSignal, ChannelOutboxSignal>();
 
         return new OutboxNetBuilder(services);
     }
@@ -143,6 +150,8 @@ public static class ServiceCollectionExtensions
     // Removes any existing ISubscriptionReader / ISubscriptionStore registrations and adds
     // the config-based reader so call order between UseConfigWebhooks and UseSqlServerContext
     // does not matter.
+    // ConfigSubscriptionStore is registered as singleton: it reads from IOptions<WebhookOptions>
+    // (itself a singleton) and has no per-request state.
     private static void ReplaceSubscriptionReader<TStore>(IServiceCollection services)
         where TStore : class, ISubscriptionReader
     {
@@ -152,6 +161,6 @@ public static class ServiceCollectionExtensions
         var existingReader = services.FirstOrDefault(d => d.ServiceType == typeof(ISubscriptionReader));
         if (existingReader is not null) services.Remove(existingReader);
 
-        services.AddScoped<ISubscriptionReader, TStore>();
+        services.AddSingleton<ISubscriptionReader, TStore>();
     }
 }

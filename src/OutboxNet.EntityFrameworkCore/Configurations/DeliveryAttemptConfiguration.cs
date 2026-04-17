@@ -32,10 +32,22 @@ public class DeliveryAttemptConfiguration : IEntityTypeConfiguration<DeliveryAtt
             .HasForeignKey(d => d.WebhookSubscriptionId)
             .OnDelete(DeleteBehavior.Cascade);
 
-        builder.HasIndex(d => d.OutboxMessageId)
-            .HasDatabaseName("IX_DeliveryAttempts_MessageId");
+        // ── Indexes ───────────────────────────────────────────────────────────
 
-        builder.HasIndex(d => new { d.WebhookSubscriptionId, d.Status })
-            .HasDatabaseName("IX_DeliveryAttempts_SubscriptionId_Status");
+        // GetDeliveryStatesAsync GROUP BY query:
+        //   WHERE OutboxMessageId = @id AND WebhookSubscriptionId IN (...)
+        //   GROUP BY WebhookSubscriptionId
+        //   → Status included to avoid key-lookup for the MAX(CASE WHEN Status=1...) aggregate.
+        builder.HasIndex(d => new { d.OutboxMessageId, d.WebhookSubscriptionId })
+            .HasDatabaseName("IX_DeliveryAttempts_MessageId_SubscriptionId")
+            .IncludeProperties(d => d.Status);
+
+        // GetBySubscriptionIdAsync / admin queries by subscription.
+        builder.HasIndex(d => new { d.WebhookSubscriptionId, d.AttemptedAt })
+            .HasDatabaseName("IX_DeliveryAttempts_SubscriptionId_AttemptedAt");
+
+        // PurgeOldAttemptsAsync: DELETE WHERE AttemptedAt < @olderThan
+        builder.HasIndex(d => d.AttemptedAt)
+            .HasDatabaseName("IX_DeliveryAttempts_AttemptedAt");
     }
 }

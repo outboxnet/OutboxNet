@@ -283,10 +283,11 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
     public async Task ReleaseExpiredLocksAsync(CancellationToken ct = default)
     {
         var schema = _options.SchemaName;
+        // Do NOT increment RetryCount here — expired lock = infrastructure failure,
+        // not a delivery failure. See EfCoreOutboxStore.ReleaseExpiredLocksAsync.
         var sql = $"""
             UPDATE [{schema}].[OutboxMessages]
             SET [Status] = @PendingStatus,
-                [RetryCount] = [RetryCount] + 1,
                 [LockedUntil] = NULL,
                 [LockedBy] = NULL
             WHERE [Status] = @ProcessingStatus
@@ -306,5 +307,31 @@ internal sealed class DirectSqlOutboxStore : IOutboxStore
 
         if (released > 0)
             _logger.LogWarning("Released {Count} expired message locks", released);
+    }
+
+    public async Task<int> PurgeProcessedMessagesAsync(DateTimeOffset olderThan, CancellationToken ct = default)
+    {
+        var schema = _options.SchemaName;
+        var sql = $"""
+            DELETE FROM [{schema}].[OutboxMessages]
+            WHERE [Status] IN (@DeliveredStatus, @DeadLetteredStatus)
+              AND [CreatedAt] < @OlderThan
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.Add(new SqlParameter("@DeliveredStatus", SqlDbType.Int) { Value = (int)MessageStatus.Delivered });
+        command.Parameters.Add(new SqlParameter("@DeadLetteredStatus", SqlDbType.Int) { Value = (int)MessageStatus.DeadLettered });
+        command.Parameters.Add(new SqlParameter("@OlderThan", SqlDbType.DateTimeOffset) { Value = olderThan });
+
+        var deleted = await command.ExecuteNonQueryAsync(ct);
+
+        if (deleted > 0)
+            _logger.LogInformation("Purged {Count} processed/dead-lettered outbox messages older than {OlderThan}", deleted, olderThan);
+
+        return deleted;
     }
 }

@@ -1,5 +1,4 @@
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OutboxNet.Interfaces;
 
@@ -7,27 +6,29 @@ namespace OutboxNet.AzureFunctions;
 
 public sealed class OutboxTimerFunction
 {
-    private readonly IServiceProvider _serviceProvider;
+    private readonly IOutboxProcessor _processor;
     private readonly ILogger<OutboxTimerFunction> _logger;
 
     public OutboxTimerFunction(
-        IServiceProvider serviceProvider,
+        IOutboxProcessor processor,
         ILogger<OutboxTimerFunction> logger)
     {
-        _serviceProvider = serviceProvider;
+        _processor = processor;
         _logger = logger;
     }
 
+    /// <summary>
+    /// Configures the timer schedule via the <c>Outbox:TimerCron</c> app setting.
+    /// Required app setting example (every 10 seconds):
+    ///   "Outbox:TimerCron": "*/10 * * * * *"
+    /// Add this to local.settings.json under "Values" or to Azure App Settings.
+    /// </summary>
     [Function("OutboxProcessor")]
     public async Task RunAsync(
-        // Override via host.json / appsettings: "Outbox:TimerCron": "*/10 * * * * *"
         [TimerTrigger("%Outbox:TimerCron%")] TimerInfo timer,
         CancellationToken ct)
     {
         _logger.LogDebug("Outbox timer function triggered at {Time}", DateTimeOffset.UtcNow);
-
-        using var scope = _serviceProvider.CreateScope();
-        var processor = scope.ServiceProvider.GetRequiredService<IOutboxProcessor>();
-        _ = await processor.ProcessBatchAsync(ct);
+        _ = await _processor.ProcessBatchAsync(ct);
     }
 }

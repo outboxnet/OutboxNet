@@ -44,4 +44,12 @@ public interface IOutboxStore
     Task<bool> IsLockHeldAsync(Guid messageId, string lockedBy, CancellationToken ct = default);
 
     Task ReleaseExpiredLocksAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes <see cref="MessageStatus.Delivered"/> and <see cref="MessageStatus.DeadLettered"/>
+    /// messages whose <c>CreatedAt</c> is older than <paramref name="olderThan"/>.
+    /// Returns the number of rows deleted.
+    /// Call periodically (e.g. nightly) to prevent the OutboxMessages table from growing unbounded.
+    /// </summary>
+    Task<int> PurgeProcessedMessagesAsync(DateTimeOffset olderThan, CancellationToken ct = default);
 }

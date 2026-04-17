@@ -34,23 +34,35 @@ public class OutboxMessageConfiguration : IEntityTypeConfiguration<OutboxMessage
         builder.Property(m => m.UserId).HasMaxLength(256);
         builder.Property(m => m.EntityId).HasMaxLength(256);
 
-        builder.HasIndex(m => new { m.Status, m.NextRetryAt })
-            .HasDatabaseName("IX_OutboxMessages_Status_NextRetryAt");
+        // ── Indexes ───────────────────────────────────────────────────────────
 
-        // Supports ReleaseExpiredLocksAsync: WHERE Status = Processing AND LockedUntil < now
+        // Primary index for LockNextBatchAsync CTE candidate scan:
+        //   WHERE Status IN (Pending=0, Processing=1)
+        //     AND (LockedUntil IS NULL OR LockedUntil < now)
+        //     AND (NextRetryAt IS NULL OR NextRetryAt <= now)
+        //   ORDER BY CreatedAt
+        //
+        // Covering columns avoid a key-lookup back to the clustered index for the
+        // OUTPUT clause (Id, EventType, TenantId, UserId, EntityId are read).
+        // Filtered to active statuses only (Status IN (0,1)) to keep the index small.
+        builder.HasIndex(m => new { m.Status, m.CreatedAt, m.LockedUntil, m.NextRetryAt })
+            .HasDatabaseName("IX_OutboxMessages_Lock_Candidate")
+            .HasFilter("[Status] IN (0, 1)")
+            .IncludeProperties(m => new { m.TenantId, m.UserId, m.EntityId, m.EventType, m.RetryCount });
+
+        // ReleaseExpiredLocksAsync: WHERE Status=Processing AND LockedUntil < now
         builder.HasIndex(m => new { m.Status, m.LockedUntil })
             .HasDatabaseName("IX_OutboxMessages_Status_LockedUntil")
             .HasFilter("[LockedUntil] IS NOT NULL");
 
-        builder.HasIndex(m => m.CreatedAt)
-            .HasDatabaseName("IX_OutboxMessages_CreatedAt");
+        // Ordered-processing NOT EXISTS sub-query scan: filters by Status=Processing
+        // AND LockedUntil > now, partitioned by (TenantId, UserId, EntityId).
+        builder.HasIndex(m => new { m.TenantId, m.UserId, m.EntityId, m.Status, m.LockedUntil })
+            .HasDatabaseName("IX_OutboxMessages_PartitionKey_Status")
+            .HasFilter("[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
 
+        // General EventType lookup (admin queries, subscription routing checks).
         builder.HasIndex(m => m.EventType)
             .HasDatabaseName("IX_OutboxMessages_EventType");
-
-        // Partial index for ordered-processing lookups — only covers rows that have at least one key set.
-        builder.HasIndex(m => new { m.TenantId, m.UserId, m.EntityId })
-            .HasDatabaseName("IX_OutboxMessages_PartitionKey")
-            .HasFilter("[TenantId] IS NOT NULL OR [UserId] IS NOT NULL OR [EntityId] IS NOT NULL");
     }
 }

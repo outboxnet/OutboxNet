@@ -2,9 +2,27 @@ using OutboxNet.Models;
 
 namespace OutboxNet.Interfaces;
 
+/// <summary>
+/// Per-subscription delivery summary for a single outbox message.
+/// Fetched in one batch query via <see cref="IDeliveryAttemptStore.GetDeliveryStatesAsync"/>.
+/// </summary>
+public sealed record SubscriptionDeliveryState(int AttemptCount, bool HasSuccess);
+
 public interface IDeliveryAttemptStore
 {
     Task SaveAttemptAsync(DeliveryAttempt attempt, CancellationToken ct = default);
+
+    /// <summary>
+    /// Persists multiple delivery attempts in a single round-trip.
+    /// Default implementation falls back to parallel individual saves;
+    /// concrete implementations should override with a bulk INSERT for efficiency.
+    /// </summary>
+    Task SaveAttemptsAsync(IReadOnlyList<DeliveryAttempt> attempts, CancellationToken ct = default)
+    {
+        if (attempts.Count == 0) return Task.CompletedTask;
+        if (attempts.Count == 1) return SaveAttemptAsync(attempts[0], ct);
+        return Task.WhenAll(attempts.Select(a => SaveAttemptAsync(a, ct)));
+    }
 
     Task<IReadOnlyList<DeliveryAttempt>> GetByMessageIdAsync(Guid messageId, CancellationToken ct = default);
 
@@ -13,14 +31,29 @@ public interface IDeliveryAttemptStore
         int limit = 50,
         CancellationToken ct = default);
 
-    Task<int> GetAttemptCountAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default);
-
     /// <summary>
-    /// Returns <c>true</c> if there is at least one successful delivery attempt
-    /// for the given message + subscription pair.
-    /// Used to skip re-delivering to subscriptions that already succeeded on a previous attempt.
+    /// Returns the attempt count and success status for every subscription in
+    /// <paramref name="subscriptionIds"/> in a single round-trip.
+    /// Subscriptions with no attempts are absent from the returned dictionary.
     /// </summary>
-    Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default);
+    Task<IReadOnlyDictionary<Guid, SubscriptionDeliveryState>> GetDeliveryStatesAsync(
+        Guid messageId,
+        IReadOnlyList<Guid> subscriptionIds,
+        CancellationToken ct = default);
+
+    // Legacy single-subscription helpers kept for backward-compat; the pipeline
+    // uses GetDeliveryStatesAsync for efficiency.
+    async Task<int> GetAttemptCountAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
+    {
+        var states = await GetDeliveryStatesAsync(messageId, [subscriptionId], ct);
+        return states.TryGetValue(subscriptionId, out var s) ? s.AttemptCount : 0;
+    }
+
+    async Task<bool> HasSuccessfulDeliveryAsync(Guid messageId, Guid subscriptionId, CancellationToken ct = default)
+    {
+        var states = await GetDeliveryStatesAsync(messageId, [subscriptionId], ct);
+        return states.TryGetValue(subscriptionId, out var s) && s.HasSuccess;
+    }
 
     /// <summary>
     /// Deletes delivery attempt records whose <c>AttemptedAt</c> is older than

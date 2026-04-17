@@ -15,6 +15,7 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
     private readonly ISqlTransactionAccessor _transactionAccessor;
     private readonly IMessageSerializer _serializer;
     private readonly IOutboxContextAccessor _contextAccessor;
+    private readonly IOutboxSignal _signal;
     private readonly OutboxOptions _options;
     private readonly ILogger<DirectSqlOutboxPublisher> _logger;
 
@@ -22,12 +23,14 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
         ISqlTransactionAccessor transactionAccessor,
         IMessageSerializer serializer,
         IOutboxContextAccessor contextAccessor,
+        IOutboxSignal signal,
         IOptions<OutboxOptions> options,
         ILogger<DirectSqlOutboxPublisher> logger)
     {
         _transactionAccessor = transactionAccessor;
         _serializer = serializer;
         _contextAccessor = contextAccessor;
+        _signal = signal;
         _options = options.Value;
         _logger = logger;
     }
@@ -64,16 +67,16 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
         command.CommandText = sql;
         command.CommandType = CommandType.Text;
 
-        command.Parameters.Add(new SqlParameter("@Id", SqlDbType.UniqueIdentifier) { Value = messageId });
-        command.Parameters.Add(new SqlParameter("@EventType", SqlDbType.NVarChar, 256) { Value = eventType });
-        command.Parameters.Add(new SqlParameter("@Payload", SqlDbType.NVarChar, -1) { Value = serializedPayload });
-        command.Parameters.Add(new SqlParameter("@CorrelationId", SqlDbType.NVarChar, 128) { Value = (object?)correlationId ?? DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@TraceId", SqlDbType.NVarChar, 128) { Value = (object?)traceId ?? DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@Status", SqlDbType.Int) { Value = (int)MessageStatus.Pending });
-        command.Parameters.Add(new SqlParameter("@Headers", SqlDbType.NVarChar, -1) { Value = (object?)headersJson ?? DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@TenantId", SqlDbType.NVarChar, 256) { Value = (object?)_contextAccessor.TenantId ?? DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@UserId", SqlDbType.NVarChar, 256) { Value = (object?)_contextAccessor.UserId ?? DBNull.Value });
-        command.Parameters.Add(new SqlParameter("@EntityId", SqlDbType.NVarChar, 256) { Value = (object?)entityId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@Id",            SqlDbType.UniqueIdentifier) { Value = messageId });
+        command.Parameters.Add(new SqlParameter("@EventType",     SqlDbType.NVarChar, 256)    { Value = eventType });
+        command.Parameters.Add(new SqlParameter("@Payload",       SqlDbType.NVarChar, -1)     { Value = serializedPayload });
+        command.Parameters.Add(new SqlParameter("@CorrelationId", SqlDbType.NVarChar, 128)    { Value = (object?)correlationId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@TraceId",       SqlDbType.NVarChar, 128)    { Value = (object?)traceId       ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@Status",        SqlDbType.Int)              { Value = (int)MessageStatus.Pending });
+        command.Parameters.Add(new SqlParameter("@Headers",       SqlDbType.NVarChar, -1)     { Value = (object?)headersJson   ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@TenantId",      SqlDbType.NVarChar, 256)    { Value = (object?)_contextAccessor.TenantId ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@UserId",        SqlDbType.NVarChar, 256)    { Value = (object?)_contextAccessor.UserId   ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@EntityId",      SqlDbType.NVarChar, 256)    { Value = (object?)entityId ?? DBNull.Value });
 
         await command.ExecuteNonQueryAsync(cancellationToken);
 
@@ -81,5 +84,9 @@ internal sealed class DirectSqlOutboxPublisher : IOutboxPublisher
         activity?.SetTag("outbox.message_id", messageId.ToString());
 
         _logger.LogDebug("Published outbox message {MessageId} with event type {EventType}", messageId, eventType);
+
+        // Wake the processor immediately after the INSERT commits with the caller's transaction.
+        // Fire-and-forget: does not affect transactional guarantee.
+        _signal.Notify();
     }
 }

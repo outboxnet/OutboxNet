@@ -41,19 +41,15 @@ public sealed class ConfigurationTenantSecretRetriever : ITenantSecretRetriever
 
         var cacheKey = $"outbox:secret:{tenantId}";
 
-        if (!_cache.TryGetValue(cacheKey, out string? cached))
+        // GetOrCreate is atomic under IMemoryCache — only one factory invocation runs
+        // per key even under concurrent access, preventing multiple Key Vault round-trips.
+        var secret = _cache.GetOrCreate(cacheKey, entry =>
         {
-            cached = Resolve(tenantId);
-            if (cached is not null)
-            {
-                _cache.Set(cacheKey, cached, new MemoryCacheEntryOptions
-                {
-                    AbsoluteExpirationRelativeToNow = _options.SecretCacheTtl
-                });
-            }
-        }
+            entry.AbsoluteExpirationRelativeToNow = _options.SecretCacheTtl;
+            return Resolve(tenantId);
+        });
 
-        return Task.FromResult(cached);
+        return Task.FromResult(secret);
     }
 
     private string? Resolve(string tenantId)

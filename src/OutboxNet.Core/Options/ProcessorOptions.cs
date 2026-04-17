@@ -3,10 +3,11 @@ namespace OutboxNet.Options;
 public class ProcessorOptions
 {
     /// <summary>
-    /// Fixed polling interval. When <see cref="AdaptivePolling"/> is enabled this becomes
-    /// the minimum (reset-to) interval used immediately after a non-empty batch.
+    /// Minimum polling interval used after a partial (non-saturating) batch.
+    /// When the queue is saturated (full batch returned) the processor loops with
+    /// zero delay. Default: 1 second.
     /// </summary>
-    public TimeSpan PollingInterval { get; set; } = TimeSpan.FromSeconds(10);
+    public TimeSpan PollingInterval { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
     /// When true, the processor backs off exponentially during idle periods and resets to

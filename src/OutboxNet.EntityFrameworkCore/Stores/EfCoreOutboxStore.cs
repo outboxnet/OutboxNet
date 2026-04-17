@@ -187,17 +187,33 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
 
     public async Task ReleaseExpiredLocksAsync(CancellationToken ct = default)
     {
+        // Do NOT increment RetryCount here. An expired lock means the processor
+        // crashed or was killed — it is an infrastructure failure, not a delivery
+        // failure. Counting it against the message's retry budget would dead-letter
+        // messages prematurely under transient processor outages.
         var released = await _dbContext.OutboxMessages
             .Where(m => m.Status == MessageStatus.Processing
                      && m.LockedUntil != null
                      && m.LockedUntil < DateTimeOffset.UtcNow)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(m => m.Status, MessageStatus.Pending)
-                .SetProperty(m => m.RetryCount, m => m.RetryCount + 1)
                 .SetProperty(m => m.LockedUntil, (DateTimeOffset?)null)
                 .SetProperty(m => m.LockedBy, (string?)null), ct);
 
         if (released > 0)
             _logger.LogWarning("Released {Count} expired message locks", released);
+    }
+
+    public async Task<int> PurgeProcessedMessagesAsync(DateTimeOffset olderThan, CancellationToken ct = default)
+    {
+        var deleted = await _dbContext.OutboxMessages
+            .Where(m => (m.Status == MessageStatus.Delivered || m.Status == MessageStatus.DeadLettered)
+                     && m.CreatedAt < olderThan)
+            .ExecuteDeleteAsync(ct);
+
+        if (deleted > 0)
+            _logger.LogInformation("Purged {Count} processed/dead-lettered outbox messages older than {OlderThan}", deleted, olderThan);
+
+        return deleted;
     }
 }

@@ -28,6 +28,7 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
     public async Task<WebhookSubscription?> GetByIdAsync(Guid id, CancellationToken ct = default)
     {
         return await _dbContext.WebhookSubscriptions
+            .AsNoTracking()
             .FirstOrDefaultAsync(s => s.Id == id, ct);
     }
 
@@ -35,6 +36,7 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
     {
         return await _dbContext.WebhookSubscriptions
             .Where(s => s.IsActive && (s.EventType == eventType || s.EventType == "*"))
+            .AsNoTracking()
             .ToListAsync(ct);
     }
 
@@ -44,10 +46,13 @@ internal sealed class EfCoreSubscriptionStore : ISubscriptionStore
 
         // Global subscriptions (TenantId IS NULL) always match.
         // Tenant-specific subscriptions match only when TenantId equals the message's TenantId.
+        // AsNoTracking: EnrichSecretsAsync mutates Secret on these objects; we must not let
+        // EF Core track those mutations or a subsequent SaveChangesAsync will overwrite the DB.
         var subscriptions = await _dbContext.WebhookSubscriptions
             .Where(s => s.IsActive
                      && (s.EventType == message.EventType || s.EventType == "*")
                      && (s.TenantId == null || s.TenantId == tenantId))
+            .AsNoTracking()
             .ToListAsync(ct);
 
         return await EnrichSecretsAsync(subscriptions, ct);

@@ -16,6 +16,7 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
     private readonly OutboxDbContext _outboxDbContext;
     private readonly IMessageSerializer _serializer;
     private readonly IOutboxContextAccessor _contextAccessor;
+    private readonly IOutboxSignal _signal;
     private readonly OutboxOptions _options;
     private readonly ILogger<EfCoreOutboxPublisher<TDbContext>> _logger;
 
@@ -24,6 +25,7 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         OutboxDbContext outboxDbContext,
         IMessageSerializer serializer,
         IOutboxContextAccessor contextAccessor,
+        IOutboxSignal signal,
         IOptions<OutboxOptions> options,
         ILogger<EfCoreOutboxPublisher<TDbContext>> logger)
     {
@@ -31,6 +33,7 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         _outboxDbContext = outboxDbContext;
         _serializer = serializer;
         _contextAccessor = contextAccessor;
+        _signal = signal;
         _options = options.Value;
         _logger = logger;
     }
@@ -52,12 +55,17 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
 
         // Enlist the OutboxDbContext in the user's existing transaction so the
         // outbox INSERT is atomic with the caller's domain writes.
+        // Guard: if PublishAsync is called twice in the same scope the connection is
+        // already set — calling SetDbConnection again would be a no-op on the same
+        // object but avoids any EF Core internal state confusion.
+        var dbConnection = _userDbContext.Database.GetDbConnection();
         var dbTransaction = transaction.GetDbTransaction();
-        // contextOwnsConnection: false — the user's DbContext owns the connection lifetime.
-        _outboxDbContext.Database.SetDbConnection(
-            _userDbContext.Database.GetDbConnection(), contextOwnsConnection: false);
-        await _outboxDbContext.Database.UseTransactionAsync(
-            dbTransaction, cancellationToken);
+        if (_outboxDbContext.Database.GetDbConnection() != dbConnection)
+        {
+            // contextOwnsConnection: false — the user's DbContext owns the connection lifetime.
+            _outboxDbContext.Database.SetDbConnection(dbConnection, contextOwnsConnection: false);
+        }
+        await _outboxDbContext.Database.UseTransactionAsync(dbTransaction, cancellationToken);
 
         var messageId = Guid.NewGuid();
         var traceId = Activity.Current?.TraceId.ToString();
@@ -85,5 +93,10 @@ internal sealed class EfCoreOutboxPublisher<TDbContext> : IOutboxPublisher where
         activity?.SetTag("outbox.message_id", messageId.ToString());
 
         _logger.LogDebug("Published outbox message {MessageId} with event type {EventType}", messageId, eventType);
+
+        // Wake the processor immediately — eliminates polling-interval latency for the
+        // first message after an idle period. The signal is fire-and-forget; it does not
+        // affect the transactional guarantee (message is already committed).
+        _signal.Notify();
     }
 }

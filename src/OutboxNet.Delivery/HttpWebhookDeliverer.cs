@@ -22,6 +22,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
     public async Task<DeliveryResult> DeliverAsync(
         OutboxMessage message,
         WebhookSubscription subscription,
+        Guid? deliveryId = null,
         CancellationToken ct = default)
     {
         using var activity = OutboxActivitySource.Source.StartActivity("outbox.deliver_webhook");
@@ -30,7 +31,11 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
         activity?.SetTag("outbox.event_type", message.EventType);
         activity?.SetTag("outbox.webhook_url", subscription.WebhookUrl);
 
-        var deliveryId = Guid.NewGuid();
+        // Use the caller-supplied deliveryId if provided; otherwise fall back to a random one.
+        // A deterministic deliveryId (derived from MessageId + SubscriptionId + AttemptNumber)
+        // lets webhook consumers deduplicate retries of the same attempt using this header as
+        // an idempotency key.
+        var resolvedDeliveryId = deliveryId ?? Guid.NewGuid();
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
         var signature = HmacSignatureGenerator.ComputeSignature(message.Payload, subscription.Secret);
 
@@ -42,11 +47,13 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             request.Content = new StringContent(message.Payload, Encoding.UTF8);
             request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
 
-            request.Headers.Add("X-Outbox-Signature", signature);
-            request.Headers.Add("X-Outbox-Event", message.EventType);
-            request.Headers.Add("X-Outbox-Delivery-Id", deliveryId.ToString());
-            request.Headers.Add("X-Outbox-Message-Id", message.Id.ToString());
-            request.Headers.Add("X-Outbox-Timestamp", timestamp);
+            // Standard outbox headers
+            request.Headers.Add("X-Outbox-Signature",       signature);
+            request.Headers.Add("X-Outbox-Event",            message.EventType);
+            request.Headers.Add("X-Outbox-Message-Id",       message.Id.ToString());
+            request.Headers.Add("X-Outbox-Delivery-Id",      resolvedDeliveryId.ToString());
+            request.Headers.Add("X-Outbox-Subscription-Id",  subscription.Id.ToString());
+            request.Headers.Add("X-Outbox-Timestamp",        timestamp);
 
             if (message.CorrelationId is not null)
                 request.Headers.Add("X-Outbox-Correlation-Id", message.CorrelationId);
@@ -54,9 +61,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             if (subscription.CustomHeaders is not null)
             {
                 foreach (var header in subscription.CustomHeaders)
-                {
                     request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-                }
             }
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -65,14 +70,15 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
             using var response = await _httpClient.SendAsync(request, cts.Token);
             stopwatch.Stop();
 
-            var responseBody = await response.Content.ReadAsStringAsync(ct);
+            // Use the linked token so we stop reading if the per-subscription timeout fires.
+            var responseBody = await response.Content.ReadAsStringAsync(cts.Token);
             if (responseBody.Length > 4000)
                 responseBody = responseBody[..4000];
 
             var statusCode = (int)response.StatusCode;
             var success = response.IsSuccessStatusCode;
 
-            OutboxMetrics.DeliveryAttempts.Add(1, new KeyValuePair<string, object?>("event_type", message.EventType));
+            OutboxMetrics.DeliveryAttempts.Add(1,  new KeyValuePair<string, object?>("event_type", message.EventType));
             OutboxMetrics.DeliveryDuration.Record(stopwatch.Elapsed.TotalMilliseconds,
                 new KeyValuePair<string, object?>("event_type", message.EventType));
 
@@ -97,7 +103,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             stopwatch.Stop();
-            OutboxMetrics.DeliveryAttempts.Add(1, new KeyValuePair<string, object?>("event_type", message.EventType));
+            OutboxMetrics.DeliveryAttempts.Add(1,  new KeyValuePair<string, object?>("event_type", message.EventType));
             OutboxMetrics.DeliveryFailures.Add(1, new KeyValuePair<string, object?>("event_type", message.EventType));
 
             _logger.LogWarning("Webhook delivery timed out to {Url} for message {MessageId} after {Timeout}s",
@@ -108,7 +114,7 @@ internal sealed class HttpWebhookDeliverer : IWebhookDeliverer
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             stopwatch.Stop();
-            OutboxMetrics.DeliveryAttempts.Add(1, new KeyValuePair<string, object?>("event_type", message.EventType));
+            OutboxMetrics.DeliveryAttempts.Add(1,  new KeyValuePair<string, object?>("event_type", message.EventType));
             OutboxMetrics.DeliveryFailures.Add(1, new KeyValuePair<string, object?>("event_type", message.EventType));
 
             _logger.LogError(ex, "Webhook delivery failed to {Url} for message {MessageId}",

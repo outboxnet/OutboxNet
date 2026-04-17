@@ -22,7 +22,9 @@ public static class ServiceCollectionExtensions
             o.IdleBackoffFactor = options.IdleBackoffFactor;
         });
 
-        builder.Services.AddScoped<IOutboxProcessor, OutboxProcessingPipeline>();
+        // Singleton: the pipeline only takes singletons (IServiceScopeFactory, IRetryPolicy,
+        // IOptions, ILogger) and creates its own child scopes internally per batch/message.
+        builder.Services.AddSingleton<IOutboxProcessor, OutboxProcessingPipeline>();
         builder.Services.AddHostedService<OutboxProcessorService>();
 
         return builder;
