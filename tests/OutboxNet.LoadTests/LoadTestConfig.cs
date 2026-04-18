@@ -12,7 +12,7 @@ public sealed class LoadTestConfig
 
     // ── Publishing ────────────────────────────────────────────────────────────
     /// <summary>Total outbox messages to publish during the load phase.</summary>
-    public int TotalMessages { get; init; } = 1000;
+    public int TotalMessages { get; init; } = 5000;
 
     /// <summary>Max concurrent publish goroutines (each opens its own DB transaction).</summary>
     public int PublisherConcurrency { get; init; } = 20;
@@ -83,7 +83,7 @@ public sealed class LoadTestConfig
             PublisherConcurrency   = int.Parse(d.GetValueOrDefault("concurrency", "20")),
             BatchSize              = int.Parse(d.GetValueOrDefault("batch-size",  "50")),
             MaxConcurrentDeliveries= int.Parse(d.GetValueOrDefault("max-deliveries","10")),
-            ColdPollingInterval    = TimeSpan.FromMilliseconds(int.Parse(d.GetValueOrDefault("poll-ms","500"))),
+            ColdPollingInterval    = TimeSpan.FromMilliseconds(int.Parse(d.GetValueOrDefault("poll-ms","3000"))),
             ReceiverPort           = int.Parse(d.GetValueOrDefault("port",        "5556")),
             WebhookSecret          = d.GetValueOrDefault("secret",  "load-test-secret-key-change-me"),
             WebhookFailureRate     = double.Parse(d.GetValueOrDefault("failure-rate", "0.0"),

@@ -25,7 +25,10 @@ public sealed class LoadTestResult
     public long HmacRejections  { get; init; }   // HMAC mismatch (signing bug)
     public long FailuresInjected{ get; init; }   // 503 injections by the receiver
 
-    // ── Latency (publish-commit → first webhook receipt, ms) ─────────────────
+    // ── Latency ───────────────────────────────────────────────────────────────
+    // Per-message ms = receivedAt − max(commitAt, dispatchStart).
+    // In coupled (hot-path) mode dispatchStart ≤ all commits, so this reduces
+    // to the true end-to-end commit → webhook-receipt latency.
     public double[] LatenciesSorted { get; init; } = [];
 
     public double LatencyMin => LatenciesSorted.Length > 0 ? LatenciesSorted[0]    : 0;
@@ -79,7 +82,7 @@ public sealed class LoadTestResult
             Console.WriteLine($"    Retry deliveries:   {TotalRetryDeliveries:N0}  (extra HTTP calls due to retries)");
 
         Console.WriteLine();
-        Console.WriteLine("  LATENCY   (publish commit → first webhook receipt)");
+        Console.WriteLine("  LATENCY   (publish commit → webhook receipt; hot path active)");
         Console.WriteLine($"    Min   {LatencyMin,8:F0} ms");
         Console.WriteLine($"    Avg   {LatencyAvg,8:F0} ms");
         Console.WriteLine($"    P50   {LatencyP50,8:F0} ms");
