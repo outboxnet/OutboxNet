@@ -12,6 +12,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/OutboxNet.Core.Tests/OutboxNet.Core.Tests.csproj" />
     <Project Path="tests/OutboxNet.Delivery.Tests/OutboxNet.Delivery.Tests.csproj" />
+    <Project Path="tests/OutboxNet.LoadTests/OutboxNet.LoadTests.csproj" />
     <Project Path="tests/OutboxNet.Processor.Tests/OutboxNet.Processor.Tests.csproj" />
   </Folder>
 </Solution>
