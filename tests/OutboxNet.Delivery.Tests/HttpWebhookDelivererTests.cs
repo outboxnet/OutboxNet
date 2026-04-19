@@ -125,7 +125,7 @@ public class HttpWebhookDelivererTests
     [Fact]
     public async Task DeliverAsync_TruncatesLongResponseBody()
     {
-        var longBody = new string('x', 1000);
+        var longBody = new string('x', 4000);
         var handler = new MockHttpMessageHandler(new HttpResponseMessage(HttpStatusCode.BadRequest)
         {
             Content = new StringContent(longBody)
