@@ -8,13 +8,13 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
 
     <!-- NuGet package metadata (shared across all src projects) -->
-    <Version>1.0.0</Version>
+    <Version>8.2.1</Version>
     <Authors>OutboxNet Contributors</Authors>
     <Company>OutboxNet</Company>
-    <Copyright>Copyright (c) 2024 OutboxNet Contributors</Copyright>
+    <Copyright>Copyright (c) 2026 OutboxNet Contributors</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/undefined-exception/OutboxNet</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/undefined-exception/OutboxNet.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/outboxnet/OutboxNet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/outboxnet/OutboxNet.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
